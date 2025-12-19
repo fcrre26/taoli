@@ -39,6 +39,7 @@ import pandas as pd  # type: ignore
 import streamlit as st  # type: ignore
 import plotly.express as px
 import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # ========== 配置默认值（最终在面板里调） ==========
@@ -934,24 +935,15 @@ def get_dex_price_and_stable_token(
         return None, None, None, None, None, None
 
 
-def fetch_all_stable_status(
-    configs: list[dict],
+def _fetch_single_stable_status(
+    cfg: dict,
     global_threshold: float | None = None,
-):
+) -> list[dict]:
     """
-    获取给定配置列表里所有稳定币当前状态。
-    返回列表，每项示例：
-    {
-        "name": "USDT",
-        "chain": "bsc",
-        "price": 0.997,
-        "deviation_pct": -0.3,
-        "threshold": 0.5,
-        "is_alert": False,
-    }
+    获取单个配置的稳定币状态（用于并发执行）。
     """
     results: list[dict] = []
-    for cfg in configs:
+    try:
         (
             pair_price,
             token_address,
@@ -961,7 +953,7 @@ def fetch_all_stable_status(
             counter_address,
         ) = get_dex_price_and_stable_token(cfg["chain"], cfg["pair_address"])
         if pair_price is None:
-            continue
+            return results
 
         anchor = cfg.get("anchor_price", 1.0)
         # 如果传入了全局阈值，就统一使用全局阈值；否则回退到配置里的值或默认值
@@ -1073,7 +1065,62 @@ def fetch_all_stable_status(
                         "counter_symbol": main_symbol,
                     }
                 )
+    except Exception as e:
+        print(f"[错误] 处理配置失败: chain={cfg.get('chain')}, pair={cfg.get('pair_address')}, err={e}")
     return results
+
+
+def fetch_all_stable_status(
+    configs: list[dict],
+    global_threshold: float | None = None,
+    max_workers: int = 10,
+):
+    """
+    获取给定配置列表里所有稳定币当前状态（使用并发优化性能）。
+    返回列表，每项示例：
+    {
+        "name": "USDT",
+        "chain": "bsc",
+        "price": 0.997,
+        "deviation_pct": -0.3,
+        "threshold": 0.5,
+        "is_alert": False,
+    }
+    
+    参数:
+        configs: 配置列表
+        global_threshold: 全局阈值
+        max_workers: 最大并发数（默认10，可根据API限制调整）
+    """
+    if not configs:
+        return []
+    
+    # 如果配置数量较少，使用顺序执行（避免并发开销）
+    if len(configs) <= 5:
+        results: list[dict] = []
+        for cfg in configs:
+            results.extend(_fetch_single_stable_status(cfg, global_threshold))
+        return results
+    
+    # 使用线程池并发执行
+    all_results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # 提交所有任务
+        future_to_cfg = {
+            executor.submit(_fetch_single_stable_status, cfg, global_threshold): cfg
+            for cfg in configs
+        }
+        
+        # 收集结果
+        for future in as_completed(future_to_cfg):
+            cfg = future_to_cfg[future]
+            try:
+                result = future.result()
+                all_results.extend(result)
+            except Exception as e:
+                print(f"[错误] 获取配置结果失败: chain={cfg.get('chain')}, pair={cfg.get('pair_address')}, err={e}")
+    
+    return all_results
 
 
 def calculate_arbitrage_cost(
@@ -2800,9 +2847,11 @@ def run_streamlit_panel():
         st.warning("当前没有任何监控配置，请在左侧面板添加至少一个稳定币。")
         return
 
-    statuses = fetch_all_stable_status(
-        stable_configs, global_threshold=st.session_state.get("global_threshold")
-    )
+    # 性能优化：使用进度条和缓存
+    with st.spinner("正在获取稳定币数据..."):
+        statuses = fetch_all_stable_status(
+            stable_configs, global_threshold=st.session_state.get("global_threshold")
+        )
     if not statuses:
         st.warning("当前未获取到任何稳定币数据，请检查配置是否正确。")
         return
@@ -2840,15 +2889,50 @@ def run_streamlit_panel():
     )
 
     if arb_opps:
+        # 统计不同状态的套利机会
+        high_profit = [o for o in arb_opps if o["cost_detail"]["预估净利润"] > 100]
+        medium_profit = [o for o in arb_opps if 10 <= o["cost_detail"]["预估净利润"] <= 100]
+        low_profit = [o for o in arb_opps if o["cost_detail"]["预估净利润"] < 10]
+        
+        # 红绿灯状态指示
+        col_status1, col_status2, col_status3, col_status4 = st.columns(4)
+        with col_status1:
+            st.markdown(f"<div style='text-align:center;padding:10px;background-color:#d4edda;border-radius:5px;'><span style='font-size:20px;'>🟢</span><br><strong>{len(high_profit)}</strong><br>高利润(>$100)</div>", unsafe_allow_html=True)
+        with col_status2:
+            st.markdown(f"<div style='text-align:center;padding:10px;background-color:#fff3cd;border-radius:5px;'><span style='font-size:20px;'>🟡</span><br><strong>{len(medium_profit)}</strong><br>中利润($10-$100)</div>", unsafe_allow_html=True)
+        with col_status3:
+            st.markdown(f"<div style='text-align:center;padding:10px;background-color:#f8d7da;border-radius:5px;'><span style='font-size:20px;'>🔴</span><br><strong>{len(low_profit)}</strong><br>低利润(<$10)</div>", unsafe_allow_html=True)
+        with col_status4:
+            st.markdown(f"<div style='text-align:center;padding:10px;background-color:#e7f3ff;border-radius:5px;'><span style='font-size:20px;'>📊</span><br><strong>{len(arb_opps)}</strong><br>总计</div>", unsafe_allow_html=True)
+        
         st.markdown(
             f"<span style='color:green;font-weight:bold;'>当前有 {len(arb_opps)} 条跨链套利机会</span>",
             unsafe_allow_html=True,
         )
+        
+        # 初始化删除状态
+        if "arb_to_delete" not in st.session_state:
+            st.session_state["arb_to_delete"] = set()
+        
         arb_rows = []
-        for opp in arb_opps:
+        for idx, opp in enumerate(arb_opps):
             cd = opp["cost_detail"]
+            profit = cd["预估净利润"]
+            
+            # 根据利润确定状态颜色
+            if profit > 100:
+                status_icon = "🟢"
+                status_text = "高利润"
+            elif profit >= 10:
+                status_icon = "🟡"
+                status_text = "中利润"
+            else:
+                status_icon = "🔴"
+                status_text = "低利润"
+            
             arb_rows.append(
                 {
+                    "状态": f"{status_icon} {status_text}",
                     "稳定币": opp["name"],
                     "买入链": opp["cheap_chain"],
                     "卖出链": opp["rich_chain"],
@@ -2858,8 +2942,11 @@ def run_streamlit_panel():
                     "预估净利润(USD)": cd["预估净利润"],
                     "预估净利率(%)": cd["预估净利润率"],
                     "盈亏平衡资金规模(USD)": cd.get("盈亏平衡资金规模"),
+                    "删除": False,  # 用于删除按钮
+                    "_idx": idx,  # 内部索引
                 }
             )
+        
         df_arb = pd.DataFrame(arb_rows)
         df_arb_display = df_arb.copy()
         df_arb_display["买入价(USD)"] = df_arb_display["买入价(USD)"].map(
@@ -2881,7 +2968,41 @@ def run_streamlit_panel():
             df_arb_display["盈亏平衡资金规模(USD)"] = df_arb_display[
                 "盈亏平衡资金规模(USD)"
             ].map(lambda x: f"{x:.2f}" if isinstance(x, (int, float)) and x > 0 else "-")
-        st.dataframe(df_arb_display, width="stretch")
+        
+        # 显示表格，每行添加删除按钮
+        for idx, row in df_arb.iterrows():
+            col_info, col_del = st.columns([10, 1])
+            with col_info:
+                # 显示该行的关键信息
+                st.markdown(f"**{row['状态']}** | {row['稳定币']}: {row['买入链']} → {row['卖出链']} | 净利润: ${row['预估净利润(USD)']:.2f} ({row['预估净利率(%)']:+.3f}%)")
+            with col_del:
+                if st.button("🗑️", key=f"delete_arb_{idx}", help="删除此套利机会的监控配置"):
+                    # 找到对应的监控配置并删除
+                    opp = arb_opps[row["_idx"]]
+                    name = opp["name"]
+                    cheap_chain = opp["cheap_chain"]
+                    rich_chain = opp["rich_chain"]
+                    
+                    # 删除相关的监控配置
+                    removed = []
+                    configs_to_keep = []
+                    for cfg in st.session_state["stable_configs"]:
+                        if cfg.get("name") == name and cfg.get("chain") in [cheap_chain, rich_chain]:
+                            removed.append(f"{cfg.get('name')} ({cfg.get('chain')})")
+                        else:
+                            configs_to_keep.append(cfg)
+                    
+                    st.session_state["stable_configs"] = configs_to_keep
+                    save_stable_configs(configs_to_keep)
+                    if removed:
+                        st.success(f"已删除 {len(removed)} 个相关监控配置: {', '.join(removed)}")
+                    else:
+                        st.info("未找到相关的监控配置")
+                    st.rerun()
+        
+        # 也显示完整的数据表格（可选）
+        with st.expander("📊 查看完整数据表格"):
+            st.dataframe(df_arb_display.drop(columns=["删除", "_idx"]), width="stretch")
     else:
         st.markdown(
             "<span style='color:red;font-weight:bold;'>当前没有达到设定阈值的跨链套利机会</span>",
@@ -2938,16 +3059,40 @@ def run_streamlit_panel():
 
     st.markdown("---")
     st.subheader("关键稳定币仪表")
-
-    top_display = min(4, len(df))
-    cols = st.columns(top_display)
-    for i in range(top_display):
-        row = df.sort_values("deviation_pct", key=lambda s: s.abs(), ascending=False).iloc[i]
-        cols[i].metric(
-            label=f"{row['name']} ({row['chain']})",
-            value=f"{row['deviation_pct']:+.3f}%",
-            delta=f"{row['price']:.4f} USD",
-        )
+    
+    # 按偏离度排序，显示所有稳定币（优化：限制显示数量，避免卡顿）
+    max_display = min(20, len(df))  # 最多显示20个，避免页面卡顿
+    sorted_df = df.sort_values("deviation_pct", key=lambda s: s.abs(), ascending=False).head(max_display)
+    
+    # 使用多列布局，每行显示4个
+    num_cols = 4
+    num_rows = (max_display + num_cols - 1) // num_cols
+    
+    for row_idx in range(num_rows):
+        cols = st.columns(num_cols)
+        for col_idx in range(num_cols):
+            item_idx = row_idx * num_cols + col_idx
+            if item_idx < len(sorted_df):
+                row = sorted_df.iloc[item_idx]
+                with cols[col_idx]:
+                    # 根据偏离度设置颜色
+                    dev_abs = abs(row['deviation_pct'])
+                    if dev_abs >= row['threshold']:
+                        delta_color = "inverse"  # 红色（告警）
+                    elif dev_abs >= row['threshold'] * 0.5:
+                        delta_color = "normal"  # 黄色（警告）
+                    else:
+                        delta_color = "off"  # 绿色（正常）
+                    
+                    cols[col_idx].metric(
+                        label=f"{row['name']} ({row['chain']})",
+                        value=f"{row['deviation_pct']:+.3f}%",
+                        delta=f"{row['price']:.4f} USD",
+                        delta_color=delta_color,
+                    )
+    
+    if len(df) > max_display:
+        st.caption(f"显示前 {max_display} 个偏离度最大的稳定币（共 {len(df)} 个）")
 
     st.subheader("价格 vs 1 美金 对比曲线")
     symbols_available = sorted(
