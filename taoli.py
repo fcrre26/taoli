@@ -143,6 +143,39 @@ STABLE_SYMBOL_TO_COINGECKO_ID: dict[str, str] = {
 # 主流稳定币符号集合，便于在交易对中识别两侧稳定币
 STABLE_SYMBOLS: set[str] = set(STABLE_SYMBOL_TO_COINGECKO_ID.keys())
 
+# 自定义稳定币配置文件
+CUSTOM_STABLE_SYMBOLS_FILE = "custom_stable_symbols.json"
+
+def load_custom_stable_symbols() -> list[str]:
+    """加载自定义稳定币符号列表"""
+    if os.path.exists(CUSTOM_STABLE_SYMBOLS_FILE):
+        try:
+            with open(CUSTOM_STABLE_SYMBOLS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return [str(s).upper().strip() for s in data if s]
+        except Exception as e:
+            print(f"[自定义稳定币] 读取 {CUSTOM_STABLE_SYMBOLS_FILE} 失败: {e}")
+    return []
+
+def save_custom_stable_symbols(symbols: list[str]) -> None:
+    """保存自定义稳定币符号列表"""
+    try:
+        # 去重并转换为大写
+        unique_symbols = sorted(list(set([str(s).upper().strip() for s in symbols if s])))
+        with open(CUSTOM_STABLE_SYMBOLS_FILE, "w", encoding="utf-8") as f:
+            json.dump(unique_symbols, f, ensure_ascii=False, indent=2)
+        print(f"[自定义稳定币] 已保存 {len(unique_symbols)} 个自定义稳定币符号到 {CUSTOM_STABLE_SYMBOLS_FILE}")
+    except Exception as e:
+        print(f"[自定义稳定币] 保存 {CUSTOM_STABLE_SYMBOLS_FILE} 失败: {e}")
+
+def get_all_stable_symbols() -> list[str]:
+    """获取所有稳定币符号（主流 + 自定义）"""
+    custom = load_custom_stable_symbols()
+    all_symbols = sorted(list(STABLE_SYMBOLS) + custom)
+    # 去重
+    return sorted(list(set(all_symbols)))
+
 # 北京时区（UTC+8）
 BEIJING_TZ = timezone(timedelta(hours=8))
 
@@ -2403,27 +2436,106 @@ def run_streamlit_panel():
             if not st.session_state["available_chains"]:
                 st.session_state["available_chains"] = list(CHAIN_NAME_TO_ID.keys())
         
+        # 获取所有稳定币符号（包括自定义）
+        all_stable_symbols = get_all_stable_symbols()
+        
+        # 自定义稳定币管理
+        with st.expander("➕ 添加自定义稳定币"):
+            new_symbol = st.text_input(
+                "稳定币符号（如：USD0, FRAX 等）",
+                value="",
+                key="new_custom_symbol",
+                help="输入稳定币符号，会自动转换为大写",
+            )
+            col_add1, col_add2 = st.columns([1, 1])
+            with col_add1:
+                if st.button("添加", key="add_custom_symbol"):
+                    if new_symbol:
+                        symbol_upper = new_symbol.upper().strip()
+                        if symbol_upper:
+                            custom_symbols = load_custom_stable_symbols()
+                            if symbol_upper not in custom_symbols:
+                                custom_symbols.append(symbol_upper)
+                                save_custom_stable_symbols(custom_symbols)
+                                st.success(f"已添加稳定币: {symbol_upper}")
+                                st.rerun()
+                            else:
+                                st.warning(f"稳定币 {symbol_upper} 已存在")
+                        else:
+                            st.warning("请输入有效的稳定币符号")
+            with col_add2:
+                if st.button("查看已添加的自定义稳定币", key="view_custom_symbols"):
+                    custom_symbols = load_custom_stable_symbols()
+                    if custom_symbols:
+                        st.write("已添加的自定义稳定币：", ", ".join(custom_symbols))
+                    else:
+                        st.info("暂无自定义稳定币")
+        
         col_auto1, col_auto2, col_auto3 = st.columns(3)
-        auto_symbols = col_auto1.multiselect(
-            "选择要采集的稳定币",
-            options=list(STABLE_SYMBOLS),
-            default=["USDT", "USDC"],
-            help="选择要自动搜索的稳定币符号",
-        )
-        auto_chains = col_auto2.multiselect(
-            "选择要搜索的链",
-            options=st.session_state["available_chains"],
-            default=["ethereum", "bsc", "arbitrum", "base", "polygon"] if any(c in st.session_state["available_chains"] for c in ["ethereum", "bsc", "arbitrum", "base", "polygon"]) else [],
-            help="选择要在哪些链上搜索（链列表从 API 动态获取）",
-        )
-        auto_min_liq = col_auto3.number_input(
-            "最小流动性（USD）",
-            min_value=0.0,
-            max_value=1_000_000.0,
-            value=10000.0,
-            step=1000.0,
-            help="只添加流动性大于此值的交易对",
-        )
+        
+        # 初始化选择状态
+        if "auto_symbols_selected" not in st.session_state:
+            st.session_state["auto_symbols_selected"] = ["USDT", "USDC"] if "USDT" in all_stable_symbols and "USDC" in all_stable_symbols else []
+        if "auto_chains_selected" not in st.session_state:
+            default_chains = ["ethereum", "bsc", "arbitrum", "base", "polygon"] if any(c in st.session_state["available_chains"] for c in ["ethereum", "bsc", "arbitrum", "base", "polygon"]) else []
+            st.session_state["auto_chains_selected"] = default_chains
+        
+        # 稳定币选择器（带全选功能）
+        with col_auto1:
+            st.markdown("**选择要采集的稳定币**")
+            col_symbols1, col_symbols2 = st.columns([3, 1])
+            with col_symbols1:
+                auto_symbols = st.multiselect(
+                    "稳定币（可多选）",
+                    options=all_stable_symbols,
+                    default=st.session_state["auto_symbols_selected"],
+                    help="选择要自动搜索的稳定币符号",
+                    label_visibility="collapsed",
+                    key="auto_symbols_multiselect",
+                )
+                # 更新 session state
+                st.session_state["auto_symbols_selected"] = auto_symbols
+            with col_symbols2:
+                if st.button("全选", key="select_all_symbols", use_container_width=True):
+                    st.session_state["auto_symbols_selected"] = all_stable_symbols
+                    st.rerun()
+                if st.button("清空", key="clear_all_symbols", use_container_width=True):
+                    st.session_state["auto_symbols_selected"] = []
+                    st.rerun()
+        
+        # 链选择器（带全选功能）
+        with col_auto2:
+            st.markdown("**选择要搜索的链**")
+            col_chains1, col_chains2 = st.columns([3, 1])
+            with col_chains1:
+                auto_chains = st.multiselect(
+                    "链（可多选）",
+                    options=st.session_state["available_chains"],
+                    default=st.session_state["auto_chains_selected"],
+                    help="选择要在哪些链上搜索（链列表从 API 动态获取）",
+                    label_visibility="collapsed",
+                    key="auto_chains_multiselect",
+                )
+                # 更新 session state
+                st.session_state["auto_chains_selected"] = auto_chains
+            with col_chains2:
+                if st.button("全选", key="select_all_chains", use_container_width=True):
+                    st.session_state["auto_chains_selected"] = st.session_state["available_chains"]
+                    st.rerun()
+                if st.button("清空", key="clear_all_chains", use_container_width=True):
+                    st.session_state["auto_chains_selected"] = []
+                    st.rerun()
+        
+        # 最小流动性（默认 100 万美金）
+        with col_auto3:
+            auto_min_liq = st.number_input(
+                "最小流动性（USD）",
+                min_value=0.0,
+                max_value=10_000_000.0,
+                value=1_000_000.0,  # 默认 100 万美金
+                step=10000.0,
+                help="只添加流动性大于此值的交易对（默认 100 万美金）",
+            )
         
         if st.button("🚀 开始自动采集", type="primary", use_container_width=True):
             if not auto_symbols:
