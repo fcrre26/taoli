@@ -229,6 +229,11 @@ AUTH_CONFIG_FILE = os.path.join(CONFIG_DIR, "auth_config.json")
 NOTIFY_CONFIG_FILE = os.path.join(CONFIG_DIR, "notify_config.json")
 USERS_CONFIG_FILE = os.path.join(CONFIG_DIR, "users.json")
 CUSTOM_STABLE_SYMBOLS_FILE = os.path.join(CONFIG_DIR, "custom_stable_symbols.json")
+SEND_LOG_FILE = os.path.join(CONFIG_DIR, "send_log.json")  # 发送日志文件
+
+# 通知配置
+MAX_DAILY_SENDS = 5  # Server酱每天最多5条（免费限制）
+HEARTBEAT_INTERVAL = (24 * 3600) / MAX_DAILY_SENDS  # 心跳间隔（秒），24小时平均分配
 
 # 创建配置目录
 if not os.path.exists(CONFIG_DIR):
@@ -2069,14 +2074,69 @@ def find_arbitrage_opportunities(
 
 # ========== 通知层（Telegram） ==========
 
+def load_send_log() -> list[dict]:
+    """加载发送日志"""
+    if os.path.exists(SEND_LOG_FILE):
+        try:
+            with open(SEND_LOG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+        except Exception as e:
+            logger.error(f"读取发送日志失败: {e}")
+    return []
+
+
+def save_send_log(logs: list[dict]) -> None:
+    """保存发送日志"""
+    try:
+        os.makedirs(os.path.dirname(SEND_LOG_FILE), exist_ok=True)
+        # 只保留最近100条
+        if len(logs) > 100:
+            logs = logs[-100:]
+        with open(SEND_LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(logs, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"保存发送日志失败: {e}")
+
+
+def add_send_log(msg_type: str, content: str, channels: list[str], success: bool = True):
+    """添加发送日志"""
+    logs = load_send_log()
+    logs.append({
+        "time": format_beijing(),
+        "type": msg_type,
+        "content": content[:100],  # 只保存前100字符
+        "channels": channels,
+        "success": success
+    })
+    save_send_log(logs)
+    logger.info(f"发送日志: {msg_type} - {channels} - {'成功' if success else '失败'}")
+
+
+def get_today_send_count() -> int:
+    """获取今天已发送的消息数量"""
+    logs = load_send_log()
+    today = now_beijing().strftime("%Y-%m-%d")
+    count = sum(1 for log in logs if log.get("time", "").startswith(today) and log.get("success"))
+    return count
+
+
+def can_send_today() -> bool:
+    """检查今天是否还能发送消息"""
+    return get_today_send_count() < MAX_DAILY_SENDS
+
+
 def send_telegram(text: str, bot_token: str, chat_id: str):
     if not bot_token or not chat_id:
         return
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     try:
-        requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=5)
+        resp = requests.post(url, data={"chat_id": chat_id, "text": text}, timeout=5)
+        return resp.ok
     except Exception as e:
-        print(f"[通知错误] {e}")
+        logger.error(f"Telegram 发送失败: {e}")
+        return False
 
 
 def send_serverchan(text: str, sendkey: str):
@@ -2085,12 +2145,14 @@ def send_serverchan(text: str, sendkey: str):
     文档：https://sct.ftqq.com/
     """
     if not sendkey:
-        return
+        return False
     url = f"https://sctapi.ftqq.com/{sendkey}.send"
     try:
-        requests.post(url, data={"title": "稳定币监控通知", "desp": text}, timeout=5)
+        resp = requests.post(url, data={"title": "稳定币监控通知", "desp": text}, timeout=5)
+        return resp.ok
     except Exception as e:
-        print(f"[通知错误-Server酱] {e}")
+        logger.error(f"Server酱 发送失败: {e}")
+        return False
 
 
 def send_dingtalk(text: str, webhook: str):
@@ -2098,33 +2160,37 @@ def send_dingtalk(text: str, webhook: str):
     通过钉钉自定义机器人发送文本消息。
     """
     if not webhook:
-        return
+        return False
     try:
-        requests.post(
+        resp = requests.post(
             webhook,
             json={"msgtype": "text", "text": {"content": text}},
             timeout=5,
         )
+        return resp.ok
     except Exception as e:
-        print(f"[通知错误-钉钉] {e}")
+        logger.error(f"钉钉 发送失败: {e}")
+        return False
 
 
-def send_all_notifications(text: str, notify_cfg: dict | None = None):
+def send_all_notifications(text: str, notify_cfg: dict | None = None, msg_type: str = "通知"):
     """
     多渠道发送通知：Telegram / Server酱 / 钉钉。
-
-    使用方式：
-    - Panel 中的“发送测试通知”等场景会显式传入 notify_cfg，只发送到这套配置。
-    - CLI / 面板脱锚 & 套利告警：不传 notify_cfg，按 users.json 中的用户列表分发；
-      如无有效用户，则退回到全局 notify_config.json。
-    notify_cfg 结构示例：
-    {
-        "telegram_bot_token": "...",
-        "telegram_chat_id": "...",
-        "serverchan_sendkey": "...",
-        "dingtalk_webhook": "..."
-    }
+    带额度管理和日志记录。
+    
+    参数:
+        text: 通知内容
+        notify_cfg: 通知配置（测试用）
+        msg_type: 消息类型（用于日志）
     """
+    # 检查今日发送额度
+    if notify_cfg is None and not can_send_today():
+        logger.warning(f"今日发送额度已用完（{MAX_DAILY_SENDS}条），跳过发送")
+        return False
+    
+    sent_channels = []
+    success = False
+    
     # 如果显式传入了 notify_cfg（例如面板测试按钮），仅按这套配置发送一次
     if notify_cfg is not None:
         tg_token = notify_cfg.get("telegram_bot_token") or DEFAULT_TELEGRAM_BOT_TOKEN
@@ -2133,12 +2199,20 @@ def send_all_notifications(text: str, notify_cfg: dict | None = None):
         dt_hook = notify_cfg.get("dingtalk_webhook") or DEFAULT_DINGTALK_WEBHOOK
 
         if tg_token and tg_chat:
-            send_telegram(text, tg_token, tg_chat)
+            if send_telegram(text, tg_token, tg_chat):
+                sent_channels.append("Telegram")
+                success = True
         if sc_key:
-            send_serverchan(text, sc_key)
+            if send_serverchan(text, sc_key):
+                sent_channels.append("Server酱")
+                success = True
         if dt_hook:
-            send_dingtalk(text, dt_hook)
-        return
+            if send_dingtalk(text, dt_hook):
+                sent_channels.append("钉钉")
+                success = True
+        
+        add_send_log("测试", text, sent_channels, success)
+        return success
 
     # 未显式传入配置：优先按用户列表（users.json）分发
     users = load_users()
@@ -2176,15 +2250,24 @@ def send_all_notifications(text: str, notify_cfg: dict | None = None):
             sc_key = user.get("serverchan_sendkey") or DEFAULT_SERVERCHAN_SENDKEY
             dt_hook = user.get("dingtalk_webhook") or DEFAULT_DINGTALK_WEBHOOK
             if tg_token and tg_chat:
-                send_telegram(text, tg_token, tg_chat)
+                if send_telegram(text, tg_token, tg_chat):
+                    sent_channels.append("Telegram")
+                    success = True
             if sc_key:
-                send_serverchan(text, sc_key)
+                if send_serverchan(text, sc_key):
+                    sent_channels.append("Server酱")
+                    success = True
             if dt_hook:
-                send_dingtalk(text, dt_hook)
-        return
+                if send_dingtalk(text, dt_hook):
+                    sent_channels.append("钉钉")
+                    success = True
+        
+        add_send_log(msg_type, text, sent_channels, success)
+        return success
 
-    # 如无有效用户，则不发送（认为当前没有任何订阅用户）
-    return
+    # 如无有效用户，则不发送
+    logger.warning("没有有效用户，跳过发送")
+    return False
 
 
 # ========== CLI 监控：脱锚 + 跨链套利告警 ==========
@@ -2259,33 +2342,37 @@ def run_cli_monitor_with_alerts():
                 else:
                     logger.info(status_msg)
 
-                # 单币脱锚 Telegram 提醒（只在“刚从正常变为脱锚”时发一次）
+                # 单币脱锚 Telegram 提醒（只在"刚从正常变为脱锚"时发一次）
                 key_nc = f"{name}_{chain}"
                 prev = last_alert_state.get(key_nc, False)
                 if is_alert and not prev:
-                    # 使用 Coingecko 做一次全局 cross-check + 稳定币对交叉核对
-                    global_text = ""
-                    if symbol:
-                        cg_prices = get_coingecko_prices([symbol])
-                        cg_price = cg_prices.get(symbol)
-                        if cg_price:
-                            global_dev = (cg_price - 1.0) * 100
-                            global_text = (
-                                f"\nCoingecko 全局参考: {symbol} ≈ {cg_price:.6f} USD "
-                                f"(全局偏离 {global_dev:+.3f}%)."
-                            )
+                    # 检查今日额度
+                    if can_send_today():
+                        # 使用 Coingecko 做一次全局 cross-check + 稳定币对交叉核对
+                        global_text = ""
+                        if symbol:
+                            cg_prices = get_coingecko_prices([symbol])
+                            cg_price = cg_prices.get(symbol)
+                            if cg_price:
+                                global_dev = (cg_price - 1.0) * 100
+                                global_text = (
+                                    f"\nCoingecko 全局参考: {symbol} ≈ {cg_price:.6f} USD "
+                                    f"(全局偏离 {global_dev:+.3f}%)."
+                                )
 
-                    pair_text = build_pair_crosscheck_text(s)
+                        pair_text = build_pair_crosscheck_text(s)
 
-                    msg = (
-                        f"[稳定币脱锚告警]\n"
-                        f"{name} ({chain})\n"
-                        f"价格: {price:.6f} USD\n"
-                        f"偏离: {dev:+.3f}% (阈值 ±{threshold:.3f}%)"
-                        f"{global_text}{pair_text}"
-                    )
-                    send_all_notifications(msg)
-                    total_alerts += 1
+                        msg = (
+                            f"[稳定币脱锚告警]\n"
+                            f"{name} ({chain})\n"
+                            f"价格: {price:.6f} USD\n"
+                            f"偏离: {dev:+.3f}% (阈值 ±{threshold:.3f}%)"
+                            f"{global_text}{pair_text}"
+                        )
+                        send_all_notifications(msg, msg_type="脱锚告警")
+                        total_alerts += 1
+                    else:
+                        logger.warning(f"今日额度已用完，跳过脱锚告警: {name} ({chain})")
                 last_alert_state[key_nc] = is_alert
 
             # ========= 跨链套利机会扫描 =========
@@ -2318,22 +2405,25 @@ def run_cli_monitor_with_alerts():
                     last_ts = last_arb_alerts.get(key, 0.0)
                     # 同一机会 5 分钟内只推一次
                     if now_ts - last_ts > 300:
-                        msg = (
-                            "[跨链套利机会]\n"
-                            f"{name}\n"
-                            f"买入链: {cheap_chain}  价格: {opp['cheap_price']:.6f} USD\n"
-                            f"卖出链: {rich_chain}  价格: {opp['rich_price']:.6f} USD\n"
-                            f"理论价差: {cd['价差百分比']:+.3f}%\n"
-                            f"按资金规模 ${DEFAULT_TRADE_AMOUNT_USD:.0f} 估算：\n"
-                            f"预估净利润: ${cd['预估净利润']:.2f} "
-                            f"(净利率 {cd['预估净利润率']:+.3f}%)\n"
-                            f"成本明细: 源链Gas ${cd['Gas费（源链）']:.2f} / "
-                            f"目标链Gas ${cd['Gas费（目标链）']:.2f} / "
-                            f"跨链桥费 ${cd['跨链桥费']:.2f} / 滑点损失 ${cd['滑点损失']:.2f}"
-                        )
-                        send_all_notifications(msg)
-                        total_arb_opps += 1
-                        last_arb_alerts[key] = now_ts
+                        if can_send_today():
+                            msg = (
+                                "[跨链套利机会]\n"
+                                f"{name}\n"
+                                f"买入链: {cheap_chain}  价格: {opp['cheap_price']:.6f} USD\n"
+                                f"卖出链: {rich_chain}  价格: {opp['rich_price']:.6f} USD\n"
+                                f"理论价差: {cd['价差百分比']:+.3f}%\n"
+                                f"按资金规模 ${DEFAULT_TRADE_AMOUNT_USD:.0f} 估算：\n"
+                                f"预估净利润: ${cd['预估净利润']:.2f} "
+                                f"(净利率 {cd['预估净利润率']:+.3f}%)\n"
+                                f"成本明细: 源链Gas ${cd['Gas费（源链）']:.2f} / "
+                                f"目标链Gas ${cd['Gas费（目标链）']:.2f} / "
+                                f"跨链桥费 ${cd['跨链桥费']:.2f} / 滑点损失 ${cd['滑点损失']:.2f}"
+                            )
+                            send_all_notifications(msg, msg_type="套利机会")
+                            total_arb_opps += 1
+                            last_arb_alerts[key] = now_ts
+                        else:
+                            logger.warning(f"今日额度已用完，跳过套利提醒: {name} {cheap_chain}->{rich_chain}")
             else:
                 logger.info("\n当前未发现达到阈值的跨链套利机会")
 
@@ -2377,93 +2467,18 @@ def run_streamlit_panel():
         initial_sidebar_state="expanded"
     )
     
-    # 自定义 CSS 样式
+    # 简洁的 CSS 样式
     st.markdown("""
     <style>
-        /* 主题色彩 */
-        :root {
-            --primary-color: #1f77b4;
-            --success-color: #2ecc71;
-            --warning-color: #f39c12;
-            --danger-color: #e74c3c;
-        }
-        
-        /* 标题样式 */
-        .main-title {
-            font-size: 2.5rem;
-            font-weight: bold;
-            background: linear-gradient(120deg, #1f77b4, #2ecc71);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-            margin-bottom: 1rem;
-        }
-        
-        /* 指标卡片 */
-        .metric-card {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            padding: 20px;
-            border-radius: 10px;
-            color: white;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-            text-align: center;
+        /* 按钮美化 */
+        .stButton button {
+            border-radius: 5px;
+            font-size: 14px;
         }
         
         /* 表格美化 */
         .dataframe {
-            border-radius: 10px;
-            overflow: hidden;
-        }
-        
-        /* 按钮美化 */
-        .stButton button {
-            border-radius: 8px;
-            font-weight: 500;
-            transition: all 0.3s ease;
-        }
-        
-        .stButton button:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-        }
-        
-        /* 侧边栏美化 */
-        .css-1d391kg {
-            background: linear-gradient(180deg, #f8f9fa 0%, #e9ecef 100%);
-        }
-        
-        /* 输入框美化 */
-        .stTextInput input, .stNumberInput input {
-            border-radius: 8px;
-            border: 2px solid #e0e0e0;
-            transition: border-color 0.3s ease;
-        }
-        
-        .stTextInput input:focus, .stNumberInput input:focus {
-            border-color: #1f77b4;
-            box-shadow: 0 0 0 3px rgba(31,119,180,0.1);
-        }
-        
-        /* 警告框美化 */
-        .alert-danger {
-            background: linear-gradient(135deg, #ff6b6b 0%, #ee5a6f 100%);
-            color: white;
-            padding: 15px;
-            border-radius: 10px;
-            margin: 10px 0;
-        }
-        
-        .alert-success {
-            background: linear-gradient(135deg, #56ab2f 0%, #a8e063 100%);
-            color: white;
-            padding: 15px;
-            border-radius: 10px;
-            margin: 10px 0;
-        }
-        
-        /* 表格行悬停效果 */
-        .stDataFrame tr:hover {
-            background-color: #f0f7ff !important;
-            transition: background-color 0.2s ease;
+            font-size: 14px;
         }
     </style>
     """, unsafe_allow_html=True)
@@ -2512,8 +2527,7 @@ def run_streamlit_panel():
                     del st.session_state["username"]
                 st.rerun()
 
-    st.markdown("<h1 class='main-title'>🎯 多链稳定币脱锚监控面板</h1>", unsafe_allow_html=True)
-    st.markdown("---")
+    st.title("🎯 多链稳定币脱锚监控面板")
 
     # ----- 初始化 Session State -----
     if "check_interval" not in st.session_state:
@@ -3255,7 +3269,7 @@ def run_streamlit_panel():
     # 缓存统计
     cache_stats = _global_cache.get_stats()
     
-    # 美化的指标卡片
+    # 漂亮的渐变卡片
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
@@ -3299,8 +3313,7 @@ def run_streamlit_panel():
 
     # ----- 当前跨链套利机会（基于面板套利参数） -----
     st.markdown("---")
-    st.markdown("### 💰 当前跨链套利机会")
-    st.markdown("智能扫描多链价差，自动计算成本与收益")
+    st.subheader("💰 当前跨链套利机会")
 
     arb_opps = find_arbitrage_opportunities(
         statuses,
@@ -3320,14 +3333,13 @@ def run_streamlit_panel():
         medium_profit = [o for o in arb_opps if 10 <= o["cost_detail"]["预估净利润"] <= 100]
         low_profit = [o for o in arb_opps if o["cost_detail"]["预估净利润"] < 10]
         
-        # 红绿灯状态指示（优化版）
+        # 漂亮的状态指示卡片
         col_status1, col_status2, col_status3, col_status4 = st.columns(4)
         with col_status1:
             st.markdown(f"""
             <div style='text-align:center; padding:20px; 
                         background: linear-gradient(135deg, #56ab2f 0%, #a8e063 100%);
-                        border-radius:12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-                        transition: transform 0.3s ease;'>
+                        border-radius:12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);'>
                 <span style='font-size:32px;'>🟢</span>
                 <div style='color: white; font-size: 28px; font-weight: bold; margin-top: 10px;'>{len(high_profit)}</div>
                 <div style='color: white; font-size: 14px; opacity: 0.9;'>高利润 (>$100)</div>
@@ -3337,8 +3349,7 @@ def run_streamlit_panel():
             st.markdown(f"""
             <div style='text-align:center; padding:20px; 
                         background: linear-gradient(135deg, #f39c12 0%, #f1c40f 100%);
-                        border-radius:12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-                        transition: transform 0.3s ease;'>
+                        border-radius:12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);'>
                 <span style='font-size:32px;'>🟡</span>
                 <div style='color: white; font-size: 28px; font-weight: bold; margin-top: 10px;'>{len(medium_profit)}</div>
                 <div style='color: white; font-size: 14px; opacity: 0.9;'>中利润 ($10-$100)</div>
@@ -3348,8 +3359,7 @@ def run_streamlit_panel():
             st.markdown(f"""
             <div style='text-align:center; padding:20px; 
                         background: linear-gradient(135deg, #eb3349 0%, #f45c43 100%);
-                        border-radius:12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-                        transition: transform 0.3s ease;'>
+                        border-radius:12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);'>
                 <span style='font-size:32px;'>🔴</span>
                 <div style='color: white; font-size: 28px; font-weight: bold; margin-top: 10px;'>{len(low_profit)}</div>
                 <div style='color: white; font-size: 14px; opacity: 0.9;'>低利润 (<$10)</div>
@@ -3359,8 +3369,7 @@ def run_streamlit_panel():
             st.markdown(f"""
             <div style='text-align:center; padding:20px; 
                         background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
-                        border-radius:12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-                        transition: transform 0.3s ease;'>
+                        border-radius:12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);'>
                 <span style='font-size:32px;'>📊</span>
                 <div style='color: white; font-size: 28px; font-weight: bold; margin-top: 10px;'>{len(arb_opps)}</div>
                 <div style='color: white; font-size: 14px; opacity: 0.9;'>总计</div>
@@ -3479,81 +3488,54 @@ def run_streamlit_panel():
             for _ in row
         ]
 
-    st.markdown("### 📊 完整数据表格")
-    st.markdown("实时监控所有稳定币状态")
+    st.subheader("📊 实时监控数据表格")
     
-    # 创建自定义表格，包含删除按钮列
-    # 美化的表头
-    st.markdown("""
-    <div style='background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); 
-                padding: 15px; border-radius: 10px 10px 0 0; margin-top: 20px;'>
-    """, unsafe_allow_html=True)
+    # 自定义表格，每行带删除按钮
+    # 表头
+    cols_header = st.columns([2, 1.5, 2, 1.5, 1.5, 1.5, 1])
+    cols_header[0].markdown("**名称**")
+    cols_header[1].markdown("**链**")
+    cols_header[2].markdown("**价格(USD)**")
+    cols_header[3].markdown("**偏离**")
+    cols_header[4].markdown("**阈值**")
+    cols_header[5].markdown("**告警**")
+    cols_header[6].markdown("**删除**")
     
-    col_headers = st.columns([2, 1.5, 1.5, 1.5, 1.5, 1.5, 1])
-    col_headers[0].markdown("<div style='color: white; font-weight: bold;'>📌 名称</div>", unsafe_allow_html=True)
-    col_headers[1].markdown("<div style='color: white; font-weight: bold;'>⛓️ 链</div>", unsafe_allow_html=True)
-    col_headers[2].markdown("<div style='color: white; font-weight: bold;'>💵 价格(USD)</div>", unsafe_allow_html=True)
-    col_headers[3].markdown("<div style='color: white; font-weight: bold;'>📉 偏离</div>", unsafe_allow_html=True)
-    col_headers[4].markdown("<div style='color: white; font-weight: bold;'>⚙️ 阈值</div>", unsafe_allow_html=True)
-    col_headers[5].markdown("<div style='color: white; font-weight: bold;'>🚨 告警</div>", unsafe_allow_html=True)
-    col_headers[6].markdown("<div style='color: white; font-weight: bold;'>🗑️ 操作</div>", unsafe_allow_html=True)
+    st.markdown("---")
     
-    st.markdown("</div>", unsafe_allow_html=True)
-    
-    # 表格内容行（美化版）
+    # 表格内容行
     for idx, row in df.iterrows():
-        # 根据告警状态设置样式
+        # 根据告警状态设置背景色
         if row["is_alert"]:
-            bg_color = "linear-gradient(135deg, #ffcccc 0%, #ffe6e6 100%)"
-            border_color = "#e74c3c"
-            alert_icon = "🔴"
-            alert_text = "告警"
+            bg_style = "background-color: #ffcccc; padding: 8px; border-radius: 5px; margin: 2px 0;"
         else:
-            bg_color = "linear-gradient(135deg, #f8f9fa 0%, #ffffff 100%)"
-            border_color = "#2ecc71"
-            alert_icon = "🟢"
-            alert_text = "正常"
+            bg_style = "background-color: #f8f9fa; padding: 8px; border-radius: 5px; margin: 2px 0;"
         
-        st.markdown(f"""
-        <div style='background: {bg_color}; 
-                    border-left: 4px solid {border_color};
-                    padding: 15px;
-                    margin: 8px 0;
-                    border-radius: 8px;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
-                    transition: all 0.3s ease;'>
-        """, unsafe_allow_html=True)
-        
-        cols = st.columns([2, 1.5, 1.5, 1.5, 1.5, 1.5, 1])
+        cols = st.columns([2, 1.5, 2, 1.5, 1.5, 1.5, 1])
         
         with cols[0]:
-            st.markdown(f"<div style='font-weight: 600;'>{row['name']}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div style='{bg_style}'>{row['name']}</div>", unsafe_allow_html=True)
         with cols[1]:
-            st.markdown(f"<div><span style='background: #e3f2fd; padding: 3px 8px; border-radius: 4px;'>{row['chain']}</span></div>", unsafe_allow_html=True)
+            st.markdown(f"<div style='{bg_style}'>{row['chain']}</div>", unsafe_allow_html=True)
         with cols[2]:
-            st.markdown(f"<div style='font-family: monospace;'>${row['price']:.6f}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div style='{bg_style}'>{row['price']:.6f}</div>", unsafe_allow_html=True)
         with cols[3]:
-            deviation_color = "#e74c3c" if abs(row['deviation_pct']) >= row['threshold'] else "#2ecc71"
-            st.markdown(f"<div style='color: {deviation_color}; font-weight: bold;'>{row['deviation_pct']:+.3f}%</div>", unsafe_allow_html=True)
+            color = "red" if abs(row['deviation_pct']) >= row['threshold'] else "green"
+            st.markdown(f"<div style='{bg_style} color: {color}; font-weight: bold;'>{row['deviation_pct']:+.3f}%</div>", unsafe_allow_html=True)
         with cols[4]:
-            st.markdown(f"<div style='color: #95a5a6;'>±{row['threshold']:.3f}%</div>", unsafe_allow_html=True)
+            st.markdown(f"<div style='{bg_style}'>±{row['threshold']:.3f}%</div>", unsafe_allow_html=True)
         with cols[5]:
-            st.markdown(f"<div>{alert_icon} {alert_text}</div>", unsafe_allow_html=True)
+            alert_text = "⚠️ 是" if row["is_alert"] else "✅ 否"
+            st.markdown(f"<div style='{bg_style}'>{alert_text}</div>", unsafe_allow_html=True)
         with cols[6]:
-            # 找到对应的配置
+            # 每行的删除按钮
             matching_configs = [
                 cfg for cfg in st.session_state["stable_configs"]
                 if cfg.get("name") == row["name"] and cfg.get("chain") == row["chain"]
             ]
             
             if matching_configs:
-                if st.button(
-                    "🗑️",
-                    key=f"delete_stable_{idx}",
-                    help=f"删除 {row['name']} ({row['chain']})",
-                    use_container_width=True
-                ):
-                    # 删除匹配的配置
+                if st.button("🗑️", key=f"del_{idx}", help=f"删除 {row['name']} ({row['chain']})"):
                     configs_to_keep = [
                         cfg for cfg in st.session_state["stable_configs"]
                         if not (cfg.get("name") == row["name"] and cfg.get("chain") == row["chain"])
@@ -3562,10 +3544,6 @@ def run_streamlit_panel():
                     save_stable_configs(configs_to_keep)
                     st.success(f"✅ 已删除: {row['name']} ({row['chain']})")
                     st.rerun()
-            else:
-                st.caption("无配置")
-        
-        st.markdown("</div>", unsafe_allow_html=True)
 
     # ----- 仪表 & 曲线 -----
     # 更新历史数据
@@ -3600,8 +3578,7 @@ def run_streamlit_panel():
     logger.debug(f"历史数据已更新，当前 {len(history_df)} 条记录")
 
     st.markdown("---")
-    st.markdown("### 🎛️ 关键稳定币仪表")
-    st.markdown("按偏离度排序，实时监控重点币种")
+    st.subheader("🎛️ 关键稳定币仪表")
     
     # 按偏离度排序，显示所有稳定币（优化：限制显示数量，避免卡顿）
     max_display = min(20, len(df))  # 最多显示20个，避免页面卡顿
@@ -3621,24 +3598,41 @@ def run_streamlit_panel():
                     # 根据偏离度设置颜色
                     dev_abs = abs(row['deviation_pct'])
                     if dev_abs >= row['threshold']:
-                        delta_color = "inverse"  # 红色（告警）
+                        bg_color = "#ffe6e6"
+                        border_color = "#e74c3c"
+                        text_color = "#e74c3c"
                     elif dev_abs >= row['threshold'] * 0.5:
-                        delta_color = "normal"  # 黄色（警告）
+                        bg_color = "#fff9e6"
+                        border_color = "#f39c12"
+                        text_color = "#f39c12"
                     else:
-                        delta_color = "off"  # 绿色（正常）
+                        bg_color = "#e8f8f5"
+                        border_color = "#2ecc71"
+                        text_color = "#2ecc71"
                     
-                    cols[col_idx].metric(
-                        label=f"{row['name']} ({row['chain']})",
-                        value=f"{row['deviation_pct']:+.3f}%",
-                        delta=f"{row['price']:.4f} USD",
-                        delta_color=delta_color,
-                    )
+                    # 自定义卡片，数字更小
+                    st.markdown(f"""
+                    <div style='background: {bg_color}; 
+                                border-left: 4px solid {border_color};
+                                padding: 10px;
+                                border-radius: 5px;
+                                margin-bottom: 10px;'>
+                        <div style='font-size: 12px; color: #666; margin-bottom: 5px;'>
+                            {row['name']} ({row['chain']})
+                        </div>
+                        <div style='font-size: 20px; font-weight: bold; color: {text_color};'>
+                            {row['deviation_pct']:+.3f}%
+                        </div>
+                        <div style='font-size: 11px; color: #999; margin-top: 3px;'>
+                            ${row['price']:.4f} USD
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
     
     if len(df) > max_display:
         st.caption(f"显示前 {max_display} 个偏离度最大的稳定币（共 {len(df)} 个）")
 
-    st.markdown("### 📈 价格 vs 1 美金 对比曲线")
-    st.markdown("多链价格趋势分析，支持交互式缩放")
+    st.subheader("📈 价格 vs 1 美金 对比曲线")
     symbols_available = sorted(
         { (s.get("symbol") or "").upper() for s in statuses if s.get("symbol") }
     )
@@ -3704,8 +3698,7 @@ def run_streamlit_panel():
             st.plotly_chart(fig, width="stretch")
 
     st.markdown("---")
-    st.markdown("### 🧮 跨链套利成本计算器")
-    st.markdown("精确计算套利成本，支持自动获取 Gas 价格")
+    st.subheader("🧮 跨链套利成本计算器")
 
     # 选择源链和目标链（基于当前监控项）
     names_for_calc = [f"{s['name']} ({s['chain']})" for s in statuses]
