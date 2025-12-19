@@ -148,11 +148,14 @@ class APICache:
 # 全局缓存实例
 _global_cache = APICache()
 
-def cached(ttl: int = 10):
-    """缓存装饰器"""
+def cached(ttl: int = None):
+    """缓存装饰器（支持分级 TTL）"""
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         def wrapper(*args, **kwargs):
+            # 使用默认 TTL 如果未指定
+            actual_ttl = ttl if ttl is not None else CACHE_TTL_DEFAULT
+            
             cache_key = f"{func.__name__}_{hash((args, tuple(sorted(kwargs.items()))))}"
             cached_value = _global_cache.get(cache_key)
             if cached_value is not None:
@@ -161,7 +164,8 @@ def cached(ttl: int = 10):
             
             result = func(*args, **kwargs)
             if result is not None:
-                _global_cache.set(cache_key, result, ttl)
+                _global_cache.set(cache_key, result, actual_ttl)
+                logger.debug(f"缓存设置: {func.__name__}, TTL={actual_ttl}s")
             return result
         return wrapper
     return decorator
@@ -200,7 +204,7 @@ def sanitize_input(text: str, max_length: int = 1000) -> str:
 # ========== 常量定义 ==========
 
 # 监控配置
-DEFAULT_CHECK_INTERVAL = 20  # CLI 自动刷新频率（秒）
+DEFAULT_CHECK_INTERVAL = 30  # CLI 自动刷新频率（秒），优化为30秒
 DEFAULT_ANCHOR_PRICE = 1.0  # 锚定价
 DEFAULT_THRESHOLD = 0.5  # 脱锚阈值（%）
 
@@ -217,7 +221,7 @@ DEFAULT_MIN_PROFIT_RATE = 0.05  # 最小净利率（%）
 DEFAULT_MIN_SPREAD_PCT = 0.1  # 最小价差（%）
 
 # 缓存配置
-API_CACHE_TTL = 10  # API 缓存时间（秒）
+# API_CACHE_TTL 已废弃，使用分级缓存策略（见上方 CACHE_TTL_* 常量）
 PRICE_CACHE_TTL = 5  # 价格缓存时间（秒）
 HISTORY_MAX_RECORDS = 1000  # 历史记录最大条数
 
@@ -231,19 +235,33 @@ USERS_CONFIG_FILE = os.path.join(CONFIG_DIR, "users.json")
 CUSTOM_STABLE_SYMBOLS_FILE = os.path.join(CONFIG_DIR, "custom_stable_symbols.json")
 SEND_LOG_FILE = os.path.join(CONFIG_DIR, "send_log.json")  # 发送日志文件
 
-# 通知配置
+# 通知配置（套利优化）
 MAX_DAILY_SENDS = 5  # Server酱每天最多5条（免费限制）
-HEARTBEAT_INTERVAL = (24 * 3600) / MAX_DAILY_SENDS  # 心跳间隔（秒），24小时平均分配
+HEARTBEAT_PER_DAY = 1  # 心跳每天1次（节省额度给套利）
+ARBITRAGE_QUOTA = 4  # 套利专用额度4次
+HEARTBEAT_INTERVAL = (24 * 3600) / HEARTBEAT_PER_DAY  # 心跳间隔（秒），24小时1次
 
 # 创建配置目录
 if not os.path.exists(CONFIG_DIR):
     os.makedirs(CONFIG_DIR)
     logger.info(f"创建配置目录: {CONFIG_DIR}")
 
-# API 配置
+# API 配置（性能优化）
 API_TIMEOUT = 10  # API 请求超时（秒）
 API_RETRY_TIMES = 3  # API 重试次数
-MAX_CONCURRENT_REQUESTS = 10  # 最大并发请求数
+MAX_CONCURRENT_REQUESTS = 20  # 最大并发请求数（提升到20以加快多链价格获取）
+
+# 缓存配置（分级策略）
+CACHE_TTL_PRICE = 5  # 价格缓存时间（秒）- 短缓存以捕获套利机会
+CACHE_TTL_GAS = 30  # Gas 价格缓存时间（秒）- Gas 相对稳定
+CACHE_TTL_GLOBAL = 60  # 全局参考缓存时间（秒）- Coingecko 等
+CACHE_TTL_DEFAULT = 10  # 默认缓存时间（秒）
+
+# 套利优化配置
+MIN_PROFIT_USD = 50.0  # 最小净利润（USD）- 过滤低价值机会
+MIN_PROFIT_RATE = 2.0  # 最小净利率（%）- 确保值得操作
+MIN_PRICE_DIFF_PCT = 1.0  # 最小价差百分比（%）- 过滤假机会
+MIN_LIQUIDITY_USD = 50000.0  # 最小流动性（USD）- 确保能成交
 
 # 地址验证
 MIN_ADDRESS_LENGTH = 10  # 最小地址长度
@@ -685,7 +703,7 @@ def save_users(users: list[dict]) -> None:
         logger.error(f"保存 {USERS_CONFIG_FILE} 失败: {e}")
 
 
-@cached(ttl=API_CACHE_TTL)
+@cached(ttl=CACHE_TTL_GLOBAL)
 def get_coingecko_prices(symbols: list[str]) -> dict[str, float]:
     """
     从 Coingecko 免费 API 获取一批主流稳定币的全局 USD 价格。
@@ -1047,10 +1065,11 @@ def auto_collect_stablecoin_pairs(
 # ========== 数据获取与逻辑层 ==========
 
 @cached(ttl=PRICE_CACHE_TTL)
+@cached(ttl=CACHE_TTL_PRICE)
 def get_dex_price_from_dexscreener(chain: str, pair_address: str) -> float | None:
     """
     从 DexScreener 获取某条链上某个交易对的价格（priceUsd）。
-    带缓存，减少 API 调用。
+    带短缓存（5秒），快速捕获套利机会。
     文档示例：https://api.dexscreener.com/latest/dex/pairs/{chain}/{pairAddress}
     """
     url = f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{pair_address}"
@@ -1088,7 +1107,7 @@ def get_dex_price_from_dexscreener(chain: str, pair_address: str) -> float | Non
     return None
 
 
-@cached(ttl=PRICE_CACHE_TTL)
+@cached(ttl=CACHE_TTL_PRICE)
 def get_dex_price_and_stable_token(
     chain: str, pair_address: str
 ) -> tuple[
@@ -1193,6 +1212,7 @@ def _fetch_single_stable_status(
 ) -> list[dict]:
     """
     获取单个配置的稳定币状态（用于并发执行）。
+    现在包含流动性检查。
     """
     results: list[dict] = []
     try:
@@ -1206,6 +1226,20 @@ def _fetch_single_stable_status(
         ) = get_dex_price_and_stable_token(cfg["chain"], cfg["pair_address"])
         if pair_price is None:
             return results
+        
+        # 获取流动性数据
+        liquidity_usd = None
+        try:
+            url = f"https://api.dexscreener.com/latest/dex/pairs/{cfg['chain']}/{cfg['pair_address']}"
+            resp = requests.get(url, timeout=5)
+            if resp.ok:
+                data = resp.json()
+                pairs = data.get("pairs", [])
+                if pairs:
+                    liquidity = pairs[0].get("liquidity", {})
+                    liquidity_usd = liquidity.get("usd")
+        except Exception as e:
+            logger.debug(f"获取流动性失败: {e}")
 
         anchor = cfg.get("anchor_price", 1.0)
         # 如果传入了全局阈值，就统一使用全局阈值；否则回退到配置里的值或默认值
@@ -1282,6 +1316,7 @@ def _fetch_single_stable_status(
                     "symbol": main_symbol,
                     "pool_rate": pool_rate,
                     "counter_symbol": counter_symbol,
+                    "liquidity_usd": liquidity_usd,  # 流动性（USD）
                 }
             )
 
@@ -1315,6 +1350,7 @@ def _fetch_single_stable_status(
                         "symbol": counter_symbol_u,
                         "pool_rate": pool_rate,
                         "counter_symbol": main_symbol,
+                        "liquidity_usd": liquidity_usd,  # 流动性（USD）
                     }
                 )
     except Exception as e:
@@ -1474,9 +1510,11 @@ def get_lifi_supported_chains() -> dict[int, str] | None:
     return None
 
 
+@cached(ttl=CACHE_TTL_GAS)
 def get_lifi_gas_prices(chain_id: int) -> dict[str, float] | None:
     """
     从 LI.FI API 获取指定链的 gas 价格。
+    带中等缓存（30秒），Gas 价格相对稳定。
     返回格式: {"standard": float, "fast": float, "fastest": float}
     如果请求失败，返回 None。
     """
@@ -2028,6 +2066,16 @@ def find_arbitrage_opportunities(
         spread_pct = (rich["price"] - cheap["price"]) / cheap["price"] * 100
         if spread_pct < min_spread_pct:
             continue
+        
+        # 检查流动性（确保能成交）
+        cheap_liq = cheap.get("liquidity_usd")
+        rich_liq = rich.get("liquidity_usd")
+        if cheap_liq is not None and cheap_liq < MIN_LIQUIDITY_USD:
+            logger.debug(f"跳过低流动性池子: {name} ({cheap['chain']}) 流动性=${cheap_liq:.0f}")
+            continue
+        if rich_liq is not None and rich_liq < MIN_LIQUIDITY_USD:
+            logger.debug(f"跳过低流动性池子: {name} ({rich['chain']}) 流动性=${rich_liq:.0f}")
+            continue
 
         # 按当前默认参数估算实际净利润（初步筛选）
         cost_detail = calculate_arbitrage_cost(
@@ -2375,8 +2423,13 @@ def run_cli_monitor_with_alerts():
                         logger.warning(f"今日额度已用完，跳过脱锚告警: {name} ({chain})")
                 last_alert_state[key_nc] = is_alert
 
-            # ========= 跨链套利机会扫描 =========
-            opps = find_arbitrage_opportunities(statuses)
+            # ========= 跨链套利机会扫描（使用优化参数）=========
+            opps = find_arbitrage_opportunities(
+                statuses,
+                min_profit_usd=MIN_PROFIT_USD,
+                min_profit_rate=MIN_PROFIT_RATE,
+                min_spread_pct=MIN_PRICE_DIFF_PCT,
+            )
             if opps:
                 logger.info(f"\n🎯 检测到 {len(opps)} 个潜在跨链套利机会（已按默认成本参数估算）：")
                 for opp in opps:
@@ -2644,6 +2697,40 @@ def run_streamlit_panel():
                 gcfg["ui_config"] = {}
             gcfg["ui_config"]["global_threshold"] = default_threshold
             save_global_config(gcfg)
+        
+        st.markdown("---")
+        st.markdown("### 💰 套利优化配置")
+        
+        min_profit_usd = st.number_input(
+            "最小净利润（USD）",
+            min_value=1.0,
+            max_value=1000.0,
+            value=float(MIN_PROFIT_USD),
+            step=10.0,
+            help="过滤低于此金额的套利机会"
+        )
+        
+        min_profit_rate = st.number_input(
+            "最小净利率（%）",
+            min_value=0.1,
+            max_value=50.0,
+            value=float(MIN_PROFIT_RATE),
+            step=0.5,
+            help="过滤低于此利率的套利机会"
+        )
+        
+        min_price_diff = st.number_input(
+            "最小价差（%）",
+            min_value=0.1,
+            max_value=10.0,
+            value=float(MIN_PRICE_DIFF_PCT),
+            step=0.1,
+            help="链间价差低于此值将被忽略"
+        )
+        
+        st.caption(f"⚡ 监控间隔: {DEFAULT_CHECK_INTERVAL}秒")
+        st.caption(f"🔄 并发请求数: {MAX_CONCURRENT_REQUESTS}")
+        st.caption(f"📊 缓存策略: 价格{CACHE_TTL_PRICE}s / Gas{CACHE_TTL_GAS}s")
 
         # 保存全局配置按钮（包括 LI.FI API Key / fromAddress / UI 配置）
         col_save, col_clear = st.columns(2)
@@ -3236,11 +3323,15 @@ def run_streamlit_panel():
                 st.success(f"配置已保存到 {CONFIG_FILE}。如需 CLI 使用，请运行：python taoli.py")
 
         if col_b.button("删除当前配置") and selected_name != "<新建>":
+            # 删除匹配 (name, chain) 的配置，而不是只删除同名的
+            current_chain = current_cfg.get("chain")
             st.session_state["stable_configs"] = [
-                c for c in st.session_state["stable_configs"] if c["name"] != selected_name
+                c for c in st.session_state["stable_configs"] 
+                if not (c["name"] == selected_name and c.get("chain") == current_chain)
             ]
             save_stable_configs(st.session_state["stable_configs"])
-            st.success(f"已删除配置：{selected_name}，并已更新 {CONFIG_FILE}")
+            st.success(f"已删除配置：{selected_name} ({current_chain})，并已更新 {CONFIG_FILE}")
+            st.rerun()  # 刷新界面
 
     # ----- 主体：获取数据并展示 -----
     # 如果开启自动刷新，则通过 meta 标签让浏览器按间隔自动刷新页面
@@ -3546,18 +3637,58 @@ def run_streamlit_panel():
                 selected_idx = delete_options.index(selected_to_delete)
                 row_to_delete = df.iloc[selected_idx]
                 
+                name_to_delete = row_to_delete["name"]
+                chain_to_delete = row_to_delete["chain"]
+                
+                # 调试信息
+                logger.info(f"准备删除: name={name_to_delete}, chain={chain_to_delete}")
+                logger.info(f"删除前配置数量: {len(st.session_state['stable_configs'])}")
+                
                 # 删除配置
+                configs_before = len(st.session_state["stable_configs"])
                 configs_to_keep = [
                     cfg for cfg in st.session_state["stable_configs"]
-                    if not (cfg.get("name") == row_to_delete["name"] 
-                           and cfg.get("chain") == row_to_delete["chain"])
+                    if not (cfg.get("name") == name_to_delete and cfg.get("chain") == chain_to_delete)
                 ]
+                configs_after = len(configs_to_keep)
+                
+                logger.info(f"删除后配置数量: {configs_after}, 实际删除: {configs_before - configs_after} 个")
+                
+                # 更新 session 和保存
                 st.session_state["stable_configs"] = configs_to_keep
                 save_stable_configs(configs_to_keep)
-                st.success(f"✅ 已删除: {row_to_delete['name']} ({row_to_delete['chain']})")
+                
+                st.success(f"✅ 已删除: {name_to_delete} ({chain_to_delete}) - 删除了 {configs_before - configs_after} 个配置")
+                time.sleep(0.5)  # 等待保存完成
                 st.rerun()
     else:
         st.info("当前没有监控项")
+    
+    # 调试：显示当前配置
+    with st.expander("🔍 调试信息 - 查看当前配置"):
+        st.write(f"**配置文件路径:** `{CONFIG_FILE}`")
+        st.write(f"**Session 中配置数量:** {len(st.session_state['stable_configs'])}")
+        
+        # 显示所有配置
+        if st.session_state['stable_configs']:
+            config_display = []
+            for idx, cfg in enumerate(st.session_state['stable_configs']):
+                config_display.append({
+                    "序号": idx,
+                    "名称": cfg.get("name"),
+                    "链": cfg.get("chain"),
+                    "Pair地址": cfg.get("pair_address", "")[:20] + "...",
+                })
+            st.dataframe(pd.DataFrame(config_display), use_container_width=True)
+        else:
+            st.write("配置为空")
+        
+        # 重新加载配置按钮
+        if st.button("🔄 从文件重新加载配置"):
+            reloaded = load_stable_configs()
+            st.session_state["stable_configs"] = reloaded
+            st.success(f"已从文件重新加载 {len(reloaded)} 个配置")
+            st.rerun()
 
     # ----- 仪表 & 曲线 -----
     # 更新历史数据
@@ -3935,8 +4066,9 @@ def run_streamlit_panel():
     col_stat2.metric("剩余额度", f"{remaining} 条")
     col_stat3.metric("每日限额", f"{MAX_DAILY_SENDS} 条")
     
-    st.caption(f"💡 心跳间隔: {HEARTBEAT_INTERVAL/3600:.1f} 小时（24小时平均分配）")
-    st.caption("⚠️ 套利/脱锚告警会占用发送额度，心跳会自动调整")
+    st.caption(f"💡 心跳: 每天{HEARTBEAT_PER_DAY}次（{HEARTBEAT_INTERVAL/3600:.1f}小时间隔）")
+    st.caption(f"⚡ 套利专用额度: {ARBITRAGE_QUOTA}条/天")
+    st.caption("📌 策略: 套利优先，心跳避让，确保不错过赚钱机会")
     
     # 显示发送日志列表
     logs = load_send_log()
