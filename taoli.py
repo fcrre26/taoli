@@ -358,6 +358,49 @@ STABLE_SYMBOL_TO_COINGECKO_ID: dict[str, str] = {
 # 主流稳定币符号集合，便于在交易对中识别两侧稳定币
 STABLE_SYMBOLS: set[str] = set(STABLE_SYMBOL_TO_COINGECKO_ID.keys())
 
+# ========== 假币防护：官方合约地址白名单 ==========
+# 格式：{symbol: {chain: official_address}}
+# 只有在白名单中的合约地址才被认为是真币
+OFFICIAL_STABLE_ADDRESSES: dict[str, dict[str, str]] = {
+    "USDT": {
+        "ethereum": "0xdac17f958d2ee523a2206206994597c13d831ec7",
+        "bsc": "0x55d398326f99059ff775485246999027b3197955",
+        "polygon": "0xc2132d05d31c914a87c6611c10748aeb04b58e8f",
+        "arbitrum": "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",
+        "optimism": "0x94b008aa00579c1307b0ef2c499ad98a8ce58e58",
+        "base": "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2",
+        "avalanche": "0x9702230a8ea53601f5cd2dc00fdbc13d4df4a8c7",
+    },
+    "USDC": {
+        "ethereum": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        "bsc": "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
+        "polygon": "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359",
+        "arbitrum": "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+        "optimism": "0x0b2c639c533813f4aa9d7837caf62653d097ff85",
+        "base": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        "avalanche": "0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e",
+    },
+    "DAI": {
+        "ethereum": "0x6b175474e89094c44da98b954eedeac495271d0f",
+        "polygon": "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063",
+        "arbitrum": "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1",
+        "optimism": "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1",
+        "base": "0x50c5725949a6f0c72e6c4a641f24049a917db0cb",
+    },
+    # 可以继续添加其他稳定币的官方地址
+}
+
+# 知名 DEX 白名单（按链分类）
+TRUSTED_DEXS: dict[str, set[str]] = {
+    "ethereum": {"Uniswap V2", "Uniswap V3", "SushiSwap", "Curve", "Balancer"},
+    "bsc": {"PancakeSwap V2", "PancakeSwap V3", "Biswap", "ApeSwap", "THENA"},
+    "polygon": {"Uniswap V3", "QuickSwap", "SushiSwap", "Curve", "Balancer"},
+    "arbitrum": {"Uniswap V3", "SushiSwap", "Curve", "Camelot", "Balancer"},
+    "optimism": {"Uniswap V3", "Velodrome", "Curve", "Balancer"},
+    "base": {"Uniswap V3", "Aerodrome", "SushiSwap", "Curve", "BaseSwap"},
+    "avalanche": {"Trader Joe", "Pangolin", "Curve", "SushiSwap"},
+}
+
 # 自定义稳定币配置文件已在常量部分定义
 
 def load_custom_stable_symbols() -> list[str]:
@@ -394,6 +437,106 @@ def get_all_stable_symbols() -> list[str]:
     all_symbols = sorted(list(STABLE_SYMBOLS) + custom)
     # 去重
     return sorted(list(set(all_symbols)))
+
+
+# ========== 假币检测函数 ==========
+
+def is_official_token(symbol: str, chain: str, address: str) -> bool:
+    """
+    验证代币是否是官方合约地址
+    
+    参数:
+        symbol: 代币符号（如 USDT）
+        chain: 链标识（如 ethereum）
+        address: 合约地址
+    
+    返回:
+        True 表示是官方地址，False 表示可能是假币
+    """
+    if not address:
+        return False
+    
+    symbol_upper = symbol.upper()
+    address_lower = address.lower()
+    
+    # 检查是否在白名单中
+    if symbol_upper in OFFICIAL_STABLE_ADDRESSES:
+        official_addrs = OFFICIAL_STABLE_ADDRESSES[symbol_upper]
+        if chain in official_addrs:
+            return official_addrs[chain].lower() == address_lower
+    
+    # 不在白名单中，无法验证（可能是新链或小币种）
+    return None  # 返回 None 表示"未知"
+
+
+def check_token_legitimacy(
+    pair_data: dict,
+    min_liquidity_usd: float = 50000.0,
+    max_price_deviation: float = 0.1,  # 价格偏离 ±10%
+) -> dict:
+    """
+    检查交易对的合法性，识别假币
+    
+    返回:
+        {
+            "is_legitimate": bool,  # 是否合法
+            "warnings": list[str],  # 警告信息
+            "risk_level": str,      # 风险等级：safe/warning/danger
+        }
+    """
+    warnings = []
+    risk_level = "safe"
+    
+    chain = pair_data.get("chain", "").lower()
+    base_token = pair_data.get("base_token", {})
+    quote_token = pair_data.get("quote_token", {})
+    liquidity_usd = pair_data.get("liquidity_usd", 0)
+    price_usd = pair_data.get("price_usd")
+    
+    base_symbol = base_token.get("symbol", "").upper()
+    quote_symbol = quote_token.get("symbol", "").upper()
+    base_address = base_token.get("address", "")
+    quote_address = quote_token.get("address", "")
+    
+    # 检查1: 流动性过低
+    if liquidity_usd < min_liquidity_usd:
+        warnings.append(f"⚠️ 流动性过低: ${liquidity_usd:,.0f} < ${min_liquidity_usd:,.0f}")
+        risk_level = "warning"
+    
+    # 检查2: 价格异常（稳定币应该接近 $1）
+    if price_usd is not None:
+        if abs(price_usd - 1.0) > max_price_deviation:
+            warnings.append(f"⚠️ 价格异常: ${price_usd:.4f}（偏离锚定价 {abs(price_usd - 1.0) * 100:.1f}%）")
+            risk_level = "danger" if abs(price_usd - 1.0) > 0.5 else "warning"
+    
+    # 检查3: 验证官方合约地址
+    for token_symbol, token_address in [(base_symbol, base_address), (quote_symbol, quote_address)]:
+        if token_symbol in OFFICIAL_STABLE_ADDRESSES:
+            is_official = is_official_token(token_symbol, chain, token_address)
+            if is_official is False:
+                warnings.append(f"🚨 假币警告: {token_symbol} 的合约地址不是官方地址！")
+                warnings.append(f"   当前地址: {token_address[:10]}...")
+                official_addr = OFFICIAL_STABLE_ADDRESSES[token_symbol].get(chain, "未知")
+                warnings.append(f"   官方地址: {official_addr[:10] if official_addr != '未知' else official_addr}...")
+                risk_level = "danger"
+            elif is_official is None:
+                warnings.append(f"ℹ️ 无法验证 {token_symbol} 在 {chain} 上的地址（不在白名单）")
+    
+    # 检查4: DEX 可信度（如果有 dexId 信息）
+    dex_id = pair_data.get("dexId", "")
+    if dex_id and chain in TRUSTED_DEXS:
+        if dex_id not in TRUSTED_DEXS[chain]:
+            warnings.append(f"⚠️ 非主流 DEX: {dex_id}")
+            risk_level = "warning" if risk_level == "safe" else risk_level
+    
+    # 综合判断
+    is_legitimate = (risk_level != "danger")
+    
+    return {
+        "is_legitimate": is_legitimate,
+        "warnings": warnings,
+        "risk_level": risk_level,
+    }
 
 # 北京时区（UTC+8）
 BEIJING_TZ = timezone(timedelta(hours=8))
@@ -994,7 +1137,8 @@ def search_stablecoin_pairs(
                 except Exception:
                     price_usd = None
                 
-                results.append({
+                # 构建交易对数据
+                pair_data = {
                     "chain": chain_id,
                     "pair_address": pair_address,
                     "base_token": {
@@ -1007,7 +1151,26 @@ def search_stablecoin_pairs(
                     },
                     "liquidity_usd": liquidity_usd,
                     "price_usd": price_usd,
-                })
+                    "dexId": pair.get("dexId", ""),
+                }
+                
+                # 🛡️ 假币检测
+                legitimacy = check_token_legitimacy(
+                    pair_data,
+                    min_liquidity_usd=min_liquidity_usd,
+                    max_price_deviation=0.1,
+                )
+                
+                # 添加检测结果到数据中
+                pair_data["legitimacy"] = legitimacy
+                
+                # ⚠️ 如果是危险级别（假币），跳过
+                if legitimacy["risk_level"] == "danger":
+                    logger.warning(f"检测到假币，已过滤: {base_symbol}/{quote_symbol} on {chain_id}")
+                    logger.warning(f"  警告: {', '.join(legitimacy['warnings'])}")
+                    continue
+                
+                results.append(pair_data)
         except Exception as e:
             print(f"[自动采集] 搜索 {query} 失败: {e}")
             continue
@@ -3116,47 +3279,57 @@ def run_streamlit_panel():
         with col_auto1:
             st.markdown("**选择要采集的稳定币**")
             col_symbols1, col_symbols2 = st.columns([3, 1])
+            with col_symbols2:
+                # 先处理按钮，避免 multiselect 状态覆盖
+                if st.button("全选", key="select_all_symbols", use_container_width=True):
+                    # 直接修改 multiselect 的 key 对应的值
+                    st.session_state["auto_symbols_multiselect"] = list(all_stable_symbols)
+                    st.session_state["auto_symbols_selected"] = list(all_stable_symbols)
+                    st.rerun()
+                if st.button("清空", key="clear_all_symbols", use_container_width=True):
+                    # 直接修改 multiselect 的 key 对应的值
+                    st.session_state["auto_symbols_multiselect"] = []
+                    st.session_state["auto_symbols_selected"] = []
+                    st.rerun()
             with col_symbols1:
                 auto_symbols = st.multiselect(
                     "稳定币（可多选）",
                     options=all_stable_symbols,
-                    default=st.session_state["auto_symbols_selected"],
+                    default=st.session_state.get("auto_symbols_selected", []),
                     help="选择要自动搜索的稳定币符号",
                     label_visibility="collapsed",
                     key="auto_symbols_multiselect",
                 )
                 # 更新 session state
                 st.session_state["auto_symbols_selected"] = auto_symbols
-            with col_symbols2:
-                if st.button("全选", key="select_all_symbols", use_container_width=True):
-                    st.session_state["auto_symbols_selected"] = all_stable_symbols
-                    st.rerun()
-                if st.button("清空", key="clear_all_symbols", use_container_width=True):
-                    st.session_state["auto_symbols_selected"] = []
-                    st.rerun()
         
         # 链选择器（带全选功能）
         with col_auto2:
             st.markdown("**选择要搜索的链**")
             col_chains1, col_chains2 = st.columns([3, 1])
+            with col_chains2:
+                # 先处理按钮，避免 multiselect 状态覆盖
+                if st.button("全选", key="select_all_chains", use_container_width=True):
+                    # 直接修改 multiselect 的 key 对应的值
+                    st.session_state["auto_chains_multiselect"] = list(st.session_state["available_chains"])
+                    st.session_state["auto_chains_selected"] = list(st.session_state["available_chains"])
+                    st.rerun()
+                if st.button("清空", key="clear_all_chains", use_container_width=True):
+                    # 直接修改 multiselect 的 key 对应的值
+                    st.session_state["auto_chains_multiselect"] = []
+                    st.session_state["auto_chains_selected"] = []
+                    st.rerun()
             with col_chains1:
                 auto_chains = st.multiselect(
                     "链（可多选）",
                     options=st.session_state["available_chains"],
-                    default=st.session_state["auto_chains_selected"],
+                    default=st.session_state.get("auto_chains_selected", []),
                     help="选择要在哪些链上搜索（链列表从 API 动态获取）",
                     label_visibility="collapsed",
                     key="auto_chains_multiselect",
                 )
                 # 更新 session state
                 st.session_state["auto_chains_selected"] = auto_chains
-            with col_chains2:
-                if st.button("全选", key="select_all_chains", use_container_width=True):
-                    st.session_state["auto_chains_selected"] = st.session_state["available_chains"]
-                    st.rerun()
-                if st.button("清空", key="clear_all_chains", use_container_width=True):
-                    st.session_state["auto_chains_selected"] = []
-                    st.rerun()
         
         # 最小流动性（默认 100 万美金）
         with col_auto3:
@@ -3175,7 +3348,16 @@ def run_streamlit_panel():
             elif not auto_chains:
                 st.warning("请至少选择一条链")
             else:
-                with st.spinner(f"正在自动采集 {', '.join(auto_symbols)} 在 {', '.join(auto_chains)} 上的交易对..."):
+                # 显示实际使用的参数（调试用）
+                st.info(f"📊 将在 **{len(auto_chains)}** 条链上搜索 **{len(auto_symbols)}** 个稳定币")
+                with st.expander("🔍 查看详细参数"):
+                    st.write(f"**稳定币列表** ({len(auto_symbols)} 个):")
+                    st.write(", ".join(auto_symbols))
+                    st.write(f"**链列表** ({len(auto_chains)} 条):")
+                    st.write(", ".join(auto_chains))
+                    st.write(f"**最小流动性**: ${auto_min_liq:,.0f}")
+                
+                with st.spinner(f"正在自动采集 {len(auto_symbols)} 个稳定币在 {len(auto_chains)} 条链上的交易对..."):
                     try:
                         collected_pairs = auto_collect_stablecoin_pairs(
                             stable_symbols=auto_symbols,
@@ -3238,23 +3420,41 @@ def run_streamlit_panel():
                 )
                 exists_marker = " ⚠️已存在" if exists else ""
                 
+                # 🛡️ 获取风险等级
+                legitimacy = p.get("legitimacy", {})
+                risk_level = legitimacy.get("risk_level", "safe")
+                warnings = legitimacy.get("warnings", [])
+                
+                # 风险标记
+                risk_icons = {
+                    "safe": "✅",
+                    "warning": "⚠️",
+                    "danger": "🚨"
+                }
+                risk_icon = risk_icons.get(risk_level, "")
+                
                 # 使用列布局：复选框 + 信息
                 col_cb, col_info1, col_info2, col_info3, col_info4 = st.columns([0.5, 2, 1.5, 1.5, 2])
                 
                 with col_cb:
                     is_checked = idx in st.session_state["selected_pair_indices"]
+                    # 危险级别的禁用勾选
                     if st.checkbox(
                         "",
                         value=is_checked,
                         key=f"pair_checkbox_{idx}",
-                        disabled=exists,  # 已存在的禁用勾选
+                        disabled=exists or risk_level == "danger",
                     ):
                         st.session_state["selected_pair_indices"].add(idx)
                     else:
                         st.session_state["selected_pair_indices"].discard(idx)
                 
                 with col_info1:
-                    st.markdown(f"**{pair_name}**{exists_marker}")
+                    st.markdown(f"{risk_icon} **{pair_name}**{exists_marker}")
+                    # 显示警告信息
+                    if warnings:
+                        for warning in warnings[:2]:  # 最多显示2条
+                            st.caption(warning)
                 
                 with col_info2:
                     st.markdown(f"链: `{p['chain']}`")
