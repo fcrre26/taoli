@@ -25,7 +25,6 @@ ensure_package("requests")
 ensure_package("pandas")
 ensure_package("streamlit")
 ensure_package("plotly")
-ensure_package("streamlit-authenticator")
 
 # 避免在 Streamlit 每次重跑时刷屏，只在非 Streamlit 环境下打印一次提示
 if not os.environ.get("STREAMLIT_SERVER_PORT"):
@@ -39,7 +38,6 @@ import requests  # type: ignore
 import pandas as pd  # type: ignore
 import streamlit as st  # type: ignore
 import plotly.express as px
-import streamlit_authenticator as stauth  # type: ignore
 import hashlib
 
 
@@ -318,29 +316,15 @@ def save_global_config(cfg: dict) -> None:
 
 def load_auth_config() -> dict:
     """
-    加载登录配置（用户名、密码哈希等）。
+    加载登录配置（用户名、密码）。
     如果文件不存在，创建默认配置。
     """
-    # 生成默认密码哈希
-    default_password_hash = stauth.Hasher(["admin123"]).generate()[0]  # 默认密码：admin123
+    # 使用简单的 SHA256 哈希（自己用足够）
+    default_password_hash = hashlib.sha256("admin123".encode()).hexdigest()
     
     default_config = {
-        "credentials": {
-            "usernames": {
-                "admin": {
-                    "name": "管理员",
-                    "password": default_password_hash,
-                }
-            }
-        },
-        "cookie": {
-            "expiry_days": 30,
-            "key": "taoli_auth_key_2024",
-            "name": "taoli_auth_cookie",
-        },
-        "preauthorized": {
-            "emails": []
-        }
+        "username": "admin",
+        "password_hash": default_password_hash,
     }
     
     if os.path.exists(AUTH_CONFIG_FILE):
@@ -349,12 +333,10 @@ def load_auth_config() -> dict:
                 data = json.load(f)
             if isinstance(data, dict):
                 # 确保必要的字段存在
-                if "credentials" not in data:
-                    data["credentials"] = default_config["credentials"]
-                if "cookie" not in data:
-                    data["cookie"] = default_config["cookie"]
-                if "preauthorized" not in data:
-                    data["preauthorized"] = default_config["preauthorized"]
+                if "username" not in data:
+                    data["username"] = default_config["username"]
+                if "password_hash" not in data:
+                    data["password_hash"] = default_password_hash
                 return data
             else:
                 print(f"[登录配置] {AUTH_CONFIG_FILE} 内容格式异常，使用默认配置。")
@@ -386,46 +368,42 @@ def check_login() -> bool:
     检查用户是否已登录。
     返回 True 表示已登录，False 表示需要登录。
     """
-    if "authentication_status" not in st.session_state:
-        st.session_state["authentication_status"] = None
-    if "name" not in st.session_state:
-        st.session_state["name"] = None
-    if "username" not in st.session_state:
-        st.session_state["username"] = None
-    
     # 如果已经认证，直接返回
     if st.session_state.get("authentication_status") == True:
         return True
     
     # 加载登录配置
     config = load_auth_config()
-    
-    # 创建认证器
-    authenticator = stauth.Authenticate(
-        config["credentials"],
-        config["cookie"]["name"],
-        config["cookie"]["key"],
-        config["cookie"]["expiry_days"],
-        config.get("preauthorized", {}),
-    )
+    expected_username = config.get("username", "admin")
+    expected_password_hash = config.get("password_hash", "")
     
     # 显示登录表单
-    name, authentication_status, username = authenticator.login("登录", "main")
+    st.markdown("## 🔐 登录")
+    st.markdown("请输入用户名和密码以访问监控面板")
     
-    if authentication_status == False:
-        st.error("用户名或密码不正确")
-        return False
-    elif authentication_status == None:
-        st.warning("请输入用户名和密码")
-        return False
-    elif authentication_status == True:
-        # 登录成功，保存状态
-        st.session_state["authentication_status"] = True
-        st.session_state["name"] = name
-        st.session_state["username"] = username
-        st.session_state["authenticator"] = authenticator
-        st.session_state["auth_config"] = config
-        return True
+    col1, col2 = st.columns(2)
+    with col1:
+        username = st.text_input("用户名", value="", key="login_username")
+    with col2:
+        password = st.text_input("密码", type="password", value="", key="login_password")
+    
+    if st.button("登录", type="primary", use_container_width=True):
+        if not username or not password:
+            st.error("请输入用户名和密码")
+            return False
+        
+        # 验证用户名和密码
+        password_hash = hashlib.sha256(password.encode()).hexdigest()
+        
+        if username == expected_username and password_hash == expected_password_hash:
+            # 登录成功
+            st.session_state["authentication_status"] = True
+            st.session_state["username"] = username
+            st.success("登录成功！")
+            st.rerun()
+        else:
+            st.error("用户名或密码不正确")
+            return False
     
     return False
 
@@ -2049,8 +2027,8 @@ def run_streamlit_panel():
     # 显示登录信息和退出按钮
     with st.sidebar:
         st.markdown("---")
-        if st.session_state.get("name"):
-            st.info(f"👤 已登录: {st.session_state['name']}")
+        if st.session_state.get("username"):
+            st.info(f"👤 已登录: {st.session_state['username']}")
             
             # 修改密码功能
             with st.expander("🔐 修改密码"):
@@ -2064,28 +2042,24 @@ def run_streamlit_panel():
                     else:
                         try:
                             config = load_auth_config()
-                            username = st.session_state.get("username", "admin")
-                            if username in config["credentials"]["usernames"]:
-                                # 生成新密码哈希
-                                new_password_hash = stauth.Hasher([new_password]).generate()[0]
-                                config["credentials"]["usernames"][username]["password"] = new_password_hash
-                                save_auth_config(config)
-                                st.success("密码已修改，请重新登录")
-                                # 清除登录状态
-                                for key in ["authentication_status", "name", "username", "authenticator", "auth_config"]:
-                                    if key in st.session_state:
-                                        del st.session_state[key]
-                                st.rerun()
-                            else:
-                                st.error("用户不存在")
+                            # 生成新密码哈希（使用 SHA256）
+                            new_password_hash = hashlib.sha256(new_password.encode()).hexdigest()
+                            config["password_hash"] = new_password_hash
+                            save_auth_config(config)
+                            st.success("密码已修改，请重新登录")
+                            # 清除登录状态
+                            st.session_state["authentication_status"] = False
+                            if "username" in st.session_state:
+                                del st.session_state["username"]
+                            st.rerun()
                         except Exception as e:
                             st.error(f"修改密码失败: {e}")
             
             if st.button("🚪 退出登录"):
                 # 清除登录状态
-                for key in ["authentication_status", "name", "username", "authenticator", "auth_config"]:
-                    if key in st.session_state:
-                        del st.session_state[key]
+                st.session_state["authentication_status"] = False
+                if "username" in st.session_state:
+                    del st.session_state["username"]
                 st.rerun()
 
     st.title("多链稳定币脱锚监控面板")
