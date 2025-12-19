@@ -39,38 +39,210 @@ import pandas as pd  # type: ignore
 import streamlit as st  # type: ignore
 import plotly.express as px
 import hashlib
+import logging
+import re
+from functools import wraps
+from logging.handlers import RotatingFileHandler
+from typing import Any, Callable, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+# ========== 日志系统 ==========
+
+def setup_logger(name: str = "taoli", log_dir: str = "logs") -> logging.Logger:
+    """设置日志记录器，替代 print 输出"""
+    if not os.path.exists(log_dir):
+        os.makedirs(log_dir)
+    
+    logger = logging.getLogger(name)
+    logger.setLevel(logging.DEBUG)
+    
+    if logger.handlers:
+        return logger
+    
+    formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # 控制台处理器
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    # 文件处理器
+    file_handler = RotatingFileHandler(
+        os.path.join(log_dir, f"taoli_{datetime.now().strftime('%Y%m%d')}.log"),
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5,
+        encoding='utf-8'
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    
+    # 错误日志处理器
+    error_handler = RotatingFileHandler(
+        os.path.join(log_dir, f"taoli_error_{datetime.now().strftime('%Y%m%d')}.log"),
+        maxBytes=10*1024*1024,
+        backupCount=5,
+        encoding='utf-8'
+    )
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(formatter)
+    logger.addHandler(error_handler)
+    
+    return logger
+
+logger = setup_logger()
+
+
+# ========== API 缓存系统 ==========
+
+class CacheEntry:
+    """缓存条目"""
+    def __init__(self, value: Any, ttl: int):
+        self.value = value
+        self.expire_time = time.time() + ttl
+    
+    def is_expired(self) -> bool:
+        return time.time() > self.expire_time
+
+
+class APICache:
+    """API 缓存管理器"""
+    def __init__(self):
+        self._cache: dict[str, CacheEntry] = {}
+        self._hit_count = 0
+        self._miss_count = 0
+    
+    def get(self, key: str) -> Optional[Any]:
+        entry = self._cache.get(key)
+        if entry is None or entry.is_expired():
+            if entry:
+                del self._cache[key]
+            self._miss_count += 1
+            return None
+        self._hit_count += 1
+        return entry.value
+    
+    def set(self, key: str, value: Any, ttl: int = 10):
+        self._cache[key] = CacheEntry(value, ttl)
+    
+    def clear(self):
+        self._cache.clear()
+        self._hit_count = 0
+        self._miss_count = 0
+    
+    def get_stats(self) -> dict:
+        total = self._hit_count + self._miss_count
+        hit_rate = (self._hit_count / total * 100) if total > 0 else 0
+        return {
+            "hits": self._hit_count,
+            "misses": self._miss_count,
+            "hit_rate": f"{hit_rate:.2f}%",
+            "cache_size": len(self._cache)
+        }
+
+# 全局缓存实例
+_global_cache = APICache()
+
+def cached(ttl: int = 10):
+    """缓存装饰器"""
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            cache_key = f"{func.__name__}_{hash((args, tuple(sorted(kwargs.items()))))}"
+            cached_value = _global_cache.get(cache_key)
+            if cached_value is not None:
+                logger.debug(f"缓存命中: {func.__name__}")
+                return cached_value
+            
+            result = func(*args, **kwargs)
+            if result is not None:
+                _global_cache.set(cache_key, result, ttl)
+            return result
+        return wrapper
+    return decorator
+
+
+# ========== 安全工具函数 ==========
+
+def hash_password_secure(password: str, salt: Optional[str] = None) -> tuple[str, str]:
+    """使用 PBKDF2 + SHA256 加盐哈希密码（安全）"""
+    if salt is None:
+        salt = os.urandom(32).hex()
+    pwd_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt.encode('utf-8'), 100000).hex()
+    return pwd_hash, salt
+
+def verify_password_secure(password: str, password_hash: str, salt: str) -> bool:
+    """验证密码"""
+    pwd_hash, _ = hash_password_secure(password, salt)
+    return pwd_hash == password_hash
+
+def is_valid_ethereum_address(address: str) -> bool:
+    """验证以太坊地址格式"""
+    if not address:
+        return False
+    return bool(re.match(r'^0x[a-fA-F0-9]{40}$', address))
+
+def sanitize_input(text: str, max_length: int = 1000) -> str:
+    """清理用户输入"""
+    if not text:
+        return ""
+    text = text.strip()[:max_length]
+    return ''.join(char for char in text if ord(char) >= 32 or char in '\n\r\t')
 
 
 # ========== 配置默认值（最终在面板里调） ==========
 
-# 默认监控间隔（秒）—— CLI 循环用这个做自动刷新频率
-DEFAULT_CHECK_INTERVAL = 20
+# ========== 常量定义 ==========
 
-# 默认锚定价和脱锚阈值（主要用于“是否脱锚”的判断）
-DEFAULT_ANCHOR_PRICE = 1.0
-DEFAULT_THRESHOLD = 0.5
+# 监控配置
+DEFAULT_CHECK_INTERVAL = 20  # CLI 自动刷新频率（秒）
+DEFAULT_ANCHOR_PRICE = 1.0  # 锚定价
+DEFAULT_THRESHOLD = 0.5  # 脱锚阈值（%）
 
-# 默认成本相关参数（作为套利计算初始值）
-DEFAULT_SLIPPAGE_PCT = 0.5  # 往返滑点，百分比
-DEFAULT_BRIDGE_FEE_USD = 5.0
+# 成本相关参数
+DEFAULT_SLIPPAGE_PCT = 0.5  # 往返滑点（%）
+DEFAULT_BRIDGE_FEE_USD = 5.0  # 跨链桥费用（USD）
 
-# 默认套利扫描参数（CLI 用）
-DEFAULT_TRADE_AMOUNT_USD = 5000.0      # 默认按 5000 美金规模估算一轮套利
-DEFAULT_SRC_GAS_USD = 1.0              # 源链单轮总 Gas 估算
-DEFAULT_DST_GAS_USD = 1.0              # 目标链单轮总 Gas 估算
-DEFAULT_MIN_PROFIT_USD = 10.0          # 预估净利润至少 10 美金才提醒
-DEFAULT_MIN_PROFIT_RATE = 0.05         # 预估净利率至少 0.05% 才提醒
-DEFAULT_MIN_SPREAD_PCT = 0.1           # 最小价差（%），低于这个不看
+# 套利扫描参数
+DEFAULT_TRADE_AMOUNT_USD = 5000.0  # 套利资金规模（USD）
+DEFAULT_SRC_GAS_USD = 1.0  # 源链 Gas 费用（USD）
+DEFAULT_DST_GAS_USD = 1.0  # 目标链 Gas 费用（USD）
+DEFAULT_MIN_PROFIT_USD = 10.0  # 最小净利润（USD）
+DEFAULT_MIN_PROFIT_RATE = 0.05  # 最小净利率（%）
+DEFAULT_MIN_SPREAD_PCT = 0.1  # 最小价差（%）
 
-# 配置文件（CLI 与面板共用），存放稳定币监控列表
-CONFIG_FILE = "stable_configs.json"
+# 缓存配置
+API_CACHE_TTL = 10  # API 缓存时间（秒）
+PRICE_CACHE_TTL = 5  # 价格缓存时间（秒）
+HISTORY_MAX_RECORDS = 1000  # 历史记录最大条数
 
-# 全局配置文件（目前用于存放 LI.FI 等 API Key）
-GLOBAL_CONFIG_FILE = "global_config.json"
+# 配置文件路径
+CONFIG_DIR = "config"  # 配置目录
+CONFIG_FILE = os.path.join(CONFIG_DIR, "stable_configs.json")
+GLOBAL_CONFIG_FILE = os.path.join(CONFIG_DIR, "global_config.json")
+AUTH_CONFIG_FILE = os.path.join(CONFIG_DIR, "auth_config.json")
+NOTIFY_CONFIG_FILE = os.path.join(CONFIG_DIR, "notify_config.json")
+USERS_CONFIG_FILE = os.path.join(CONFIG_DIR, "users.json")
+CUSTOM_STABLE_SYMBOLS_FILE = os.path.join(CONFIG_DIR, "custom_stable_symbols.json")
 
-# 登录配置文件
-AUTH_CONFIG_FILE = "auth_config.json"
+# 创建配置目录
+if not os.path.exists(CONFIG_DIR):
+    os.makedirs(CONFIG_DIR)
+    logger.info(f"创建配置目录: {CONFIG_DIR}")
+
+# API 配置
+API_TIMEOUT = 10  # API 请求超时（秒）
+API_RETRY_TIMES = 3  # API 重试次数
+MAX_CONCURRENT_REQUESTS = 10  # 最大并发请求数
+
+# 地址验证
+MIN_ADDRESS_LENGTH = 10  # 最小地址长度
+ETH_ADDRESS_LENGTH = 42  # 以太坊地址长度（0x + 40字符）
 
 # 将后续损坏的 CHAIN_NAME_TO_ID 行包裹在多行字符串中，避免语法错误
 _BROKEN_CHAIN_MAPPING = """
@@ -144,8 +316,7 @@ STABLE_SYMBOL_TO_COINGECKO_ID: dict[str, str] = {
 # 主流稳定币符号集合，便于在交易对中识别两侧稳定币
 STABLE_SYMBOLS: set[str] = set(STABLE_SYMBOL_TO_COINGECKO_ID.keys())
 
-# 自定义稳定币配置文件
-CUSTOM_STABLE_SYMBOLS_FILE = "custom_stable_symbols.json"
+# 自定义稳定币配置文件已在常量部分定义
 
 def load_custom_stable_symbols() -> list[str]:
     """加载自定义稳定币符号列表"""
@@ -154,21 +325,26 @@ def load_custom_stable_symbols() -> list[str]:
             with open(CUSTOM_STABLE_SYMBOLS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, list):
-                return [str(s).upper().strip() for s in data if s]
+                symbols = [str(s).upper().strip() for s in data if s]
+                logger.debug(f"成功加载 {len(symbols)} 个自定义稳定币符号")
+                return symbols
+        except json.JSONDecodeError as e:
+            logger.error(f"自定义稳定币文件 JSON 格式错误: {e}")
         except Exception as e:
-            print(f"[自定义稳定币] 读取 {CUSTOM_STABLE_SYMBOLS_FILE} 失败: {e}")
+            logger.error(f"读取 {CUSTOM_STABLE_SYMBOLS_FILE} 失败: {e}")
     return []
 
 def save_custom_stable_symbols(symbols: list[str]) -> None:
     """保存自定义稳定币符号列表"""
     try:
+        os.makedirs(os.path.dirname(CUSTOM_STABLE_SYMBOLS_FILE), exist_ok=True)
         # 去重并转换为大写
         unique_symbols = sorted(list(set([str(s).upper().strip() for s in symbols if s])))
         with open(CUSTOM_STABLE_SYMBOLS_FILE, "w", encoding="utf-8") as f:
             json.dump(unique_symbols, f, ensure_ascii=False, indent=2)
-        print(f"[自定义稳定币] 已保存 {len(unique_symbols)} 个自定义稳定币符号到 {CUSTOM_STABLE_SYMBOLS_FILE}")
+        logger.info(f"已保存 {len(unique_symbols)} 个自定义稳定币符号到 {CUSTOM_STABLE_SYMBOLS_FILE}")
     except Exception as e:
-        print(f"[自定义稳定币] 保存 {CUSTOM_STABLE_SYMBOLS_FILE} 失败: {e}")
+        logger.error(f"保存 {CUSTOM_STABLE_SYMBOLS_FILE} 失败: {e}")
 
 def get_all_stable_symbols() -> list[str]:
     """获取所有稳定币符号（主流 + 自定义）"""
@@ -256,11 +432,17 @@ def load_stable_configs() -> list[dict]:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, list):
+                logger.debug(f"成功加载 {len(data)} 条稳定币配置")
                 return data
             else:
-                print(f"[配置] {CONFIG_FILE} 内容格式异常，需为 list，已回退到默认配置。")
+                logger.warning(f"{CONFIG_FILE} 内容格式异常，需为 list，已回退到默认配置")
+        except json.JSONDecodeError as e:
+            logger.error(f"配置文件 JSON 格式错误: {e}")
         except Exception as e:
-            print(f"[配置] 读取 {CONFIG_FILE} 失败: {e}，已回退到默认配置。")
+            logger.error(f"读取 {CONFIG_FILE} 失败: {e}")
+    else:
+        logger.info(f"{CONFIG_FILE} 不存在，使用默认配置")
+    
     return list(DEFAULT_STABLE_CONFIGS)
 
 
@@ -269,17 +451,17 @@ def save_stable_configs(configs: list[dict]) -> None:
     将稳定币监控配置保存到本地 JSON 文件，供 CLI 与面板共用。
     """
     try:
+        # 确保配置目录存在
+        os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+        
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(configs, f, ensure_ascii=False, indent=2)
-        print(f"[配置] 已保存稳定币配置到 {CONFIG_FILE}（{len(configs)} 条）。")
+        logger.info(f"已保存 {len(configs)} 条稳定币配置到 {CONFIG_FILE}")
     except Exception as e:
-        print(f"[配置] 保存 {CONFIG_FILE} 失败: {e}")
+        logger.error(f"保存 {CONFIG_FILE} 失败: {e}")
 
 
-NOTIFY_CONFIG_FILE = "notify_config.json"
-
-# 用户配置文件（多用户通知分发）
-USERS_CONFIG_FILE = "users.json"
+# 用户配置文件（多用户通知分发）已在常量部分定义
 
 
 def load_notify_config() -> dict:
@@ -299,10 +481,13 @@ def load_notify_config() -> dict:
                 data = json.load(f)
             if isinstance(data, dict):
                 cfg.update(data)
+                logger.debug("成功加载通知配置")
             else:
-                print(f"[通知配置] {NOTIFY_CONFIG_FILE} 内容格式异常，需为 dict。")
+                logger.warning(f"{NOTIFY_CONFIG_FILE} 内容格式异常，需为 dict")
+        except json.JSONDecodeError as e:
+            logger.error(f"通知配置文件 JSON 格式错误: {e}")
         except Exception as e:
-            print(f"[通知配置] 读取 {NOTIFY_CONFIG_FILE} 失败: {e}")
+            logger.error(f"读取 {NOTIFY_CONFIG_FILE} 失败: {e}")
     return cfg
 
 
@@ -311,11 +496,12 @@ def save_notify_config(cfg: dict) -> None:
     将通知配置保存到本地 JSON 文件，供 CLI 与面板共用。
     """
     try:
+        os.makedirs(os.path.dirname(NOTIFY_CONFIG_FILE), exist_ok=True)
         with open(NOTIFY_CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
-        print(f"[通知配置] 已保存到 {NOTIFY_CONFIG_FILE}。")
+        logger.info(f"已保存通知配置到 {NOTIFY_CONFIG_FILE}")
     except Exception as e:
-        print(f"[通知配置] 保存 {NOTIFY_CONFIG_FILE} 失败: {e}")
+        logger.error(f"保存 {NOTIFY_CONFIG_FILE} 失败: {e}")
 
 
 def load_global_config() -> dict:
@@ -329,10 +515,13 @@ def load_global_config() -> dict:
                 data = json.load(f)
             if isinstance(data, dict):
                 cfg.update(data)
+                logger.debug("成功加载全局配置")
             else:
-                print(f"[全局配置] {GLOBAL_CONFIG_FILE} 内容格式异常，需为 dict。")
+                logger.warning(f"{GLOBAL_CONFIG_FILE} 内容格式异常，需为 dict")
+        except json.JSONDecodeError as e:
+            logger.error(f"全局配置文件 JSON 格式错误: {e}")
         except Exception as e:
-            print(f"[全局配置] 读取 {GLOBAL_CONFIG_FILE} 失败: {e}")
+            logger.error(f"读取 {GLOBAL_CONFIG_FILE} 失败: {e}")
     return cfg
 
 
@@ -341,24 +530,27 @@ def save_global_config(cfg: dict) -> None:
     保存全局配置（目前主要是 LI.FI API Key / fromAddress）。
     """
     try:
+        os.makedirs(os.path.dirname(GLOBAL_CONFIG_FILE), exist_ok=True)
         with open(GLOBAL_CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
-        print(f"[全局配置] 已保存到 {GLOBAL_CONFIG_FILE}。")
+        logger.info(f"已保存全局配置到 {GLOBAL_CONFIG_FILE}")
     except Exception as e:
-        print(f"[全局配置] 保存 {GLOBAL_CONFIG_FILE} 失败: {e}")
+        logger.error(f"保存 {GLOBAL_CONFIG_FILE} 失败: {e}")
 
 
 def load_auth_config() -> dict:
     """
     加载登录配置（用户名、密码）。
     如果文件不存在，创建默认配置。
+    使用 PBKDF2 + SHA256 安全加密密码。
     """
-    # 使用简单的 SHA256 哈希（自己用足够）
-    default_password_hash = hashlib.sha256("admin123".encode()).hexdigest()
+    # 使用安全的 PBKDF2 哈希
+    default_password_hash, default_salt = hash_password_secure("admin123")
     
     default_config = {
         "username": "admin",
         "password_hash": default_password_hash,
+        "salt": default_salt,
     }
     
     if os.path.exists(AUTH_CONFIG_FILE):
@@ -371,6 +563,11 @@ def load_auth_config() -> dict:
                     data["username"] = default_config["username"]
                 if "password_hash" not in data:
                     data["password_hash"] = default_password_hash
+                if "salt" not in data:
+                    # 旧配置没有 salt，重新生成
+                    logger.warning("检测到旧版密码格式，正在升级...")
+                    data["password_hash"] = default_password_hash
+                    data["salt"] = default_salt
                 return data
             else:
                 print(f"[登录配置] {AUTH_CONFIG_FILE} 内容格式异常，使用默认配置。")
@@ -390,11 +587,12 @@ def save_auth_config(cfg: dict) -> None:
     保存登录配置。
     """
     try:
+        os.makedirs(os.path.dirname(AUTH_CONFIG_FILE), exist_ok=True)
         with open(AUTH_CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
-        print(f"[登录配置] 已保存到 {AUTH_CONFIG_FILE}。")
+        logger.info(f"已保存登录配置到 {AUTH_CONFIG_FILE}")
     except Exception as e:
-        print(f"[登录配置] 保存 {AUTH_CONFIG_FILE} 失败: {e}")
+        logger.error(f"保存 {AUTH_CONFIG_FILE} 失败: {e}")
 
 
 def check_login() -> bool:
@@ -410,6 +608,7 @@ def check_login() -> bool:
     config = load_auth_config()
     expected_username = config.get("username", "admin")
     expected_password_hash = config.get("password_hash", "")
+    expected_salt = config.get("salt", "")
     
     # 显示登录表单
     st.markdown("## 🔐 登录")
@@ -426,10 +625,15 @@ def check_login() -> bool:
             st.error("请输入用户名和密码")
             return False
         
-        # 验证用户名和密码
-        password_hash = hashlib.sha256(password.encode()).hexdigest()
+        # 验证用户名和密码（使用安全的验证方式）
+        if username == expected_username and expected_salt:
+            is_valid = verify_password_secure(password, expected_password_hash, expected_salt)
+        else:
+            # 兼容旧版（不推荐）
+            password_hash = hashlib.sha256(password.encode()).hexdigest()
+            is_valid = password_hash == expected_password_hash
         
-        if username == expected_username and password_hash == expected_password_hash:
+        if is_valid:
             # 登录成功
             st.session_state["authentication_status"] = True
             st.session_state["username"] = username
@@ -452,11 +656,14 @@ def load_users() -> list[dict]:
             with open(USERS_CONFIG_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, list):
+                logger.debug(f"成功加载 {len(data)} 个用户配置")
                 return data
             else:
-                print(f"[用户配置] {USERS_CONFIG_FILE} 内容格式异常，需为 list。")
+                logger.warning(f"{USERS_CONFIG_FILE} 内容格式异常，需为 list")
+        except json.JSONDecodeError as e:
+            logger.error(f"用户配置文件 JSON 格式错误: {e}")
         except Exception as e:
-            print(f"[用户配置] 读取 {USERS_CONFIG_FILE} 失败: {e}")
+            logger.error(f"读取 {USERS_CONFIG_FILE} 失败: {e}")
     return []
 
 
@@ -465,16 +672,19 @@ def save_users(users: list[dict]) -> None:
     将用户配置保存到本地 JSON 文件。
     """
     try:
+        os.makedirs(os.path.dirname(USERS_CONFIG_FILE), exist_ok=True)
         with open(USERS_CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(users, f, ensure_ascii=False, indent=2)
-        print(f"[用户配置] 已保存到 {USERS_CONFIG_FILE}（{len(users)} 个用户）。")
+        logger.info(f"已保存 {len(users)} 个用户配置到 {USERS_CONFIG_FILE}")
     except Exception as e:
-        print(f"[用户配置] 保存 {USERS_CONFIG_FILE} 失败: {e}")
+        logger.error(f"保存 {USERS_CONFIG_FILE} 失败: {e}")
 
 
+@cached(ttl=API_CACHE_TTL)
 def get_coingecko_prices(symbols: list[str]) -> dict[str, float]:
     """
     从 Coingecko 免费 API 获取一批主流稳定币的全局 USD 价格。
+    带缓存，减少 API 调用。
     返回: {symbol: price_usd}
     """
     ids: list[str] = []
@@ -491,31 +701,43 @@ def get_coingecko_prices(symbols: list[str]) -> dict[str, float]:
     if not ids:
         return {}
 
-    try:
-        params = {
-            "ids": ",".join(ids),
-            "vs_currencies": "usd",
-        }
-        resp = requests.get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params=params,
-            timeout=10,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        print(f"[Coingecko] 获取价格失败: {e}")
-        return {}
-
-    out: dict[str, float] = {}
-    for sym, cid in symbol_to_id.items():
+    for attempt in range(API_RETRY_TIMES):
         try:
-            price = float(data.get(cid, {}).get("usd"))
-            if price > 0:
-                out[sym] = price
-        except Exception:
-            continue
-    return out
+            params = {
+                "ids": ",".join(ids),
+                "vs_currencies": "usd",
+            }
+            resp = requests.get(
+                "https://api.coingecko.com/api/v3/simple/price",
+                params=params,
+                timeout=API_TIMEOUT,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            
+            out: dict[str, float] = {}
+            for sym, cid in symbol_to_id.items():
+                try:
+                    price = float(data.get(cid, {}).get("usd"))
+                    if price > 0:
+                        out[sym] = price
+                except Exception:
+                    continue
+            return out
+            
+        except requests.exceptions.Timeout:
+            logger.warning(f"Coingecko API 超时 (尝试 {attempt + 1}/{API_RETRY_TIMES})")
+            if attempt < API_RETRY_TIMES - 1:
+                time.sleep(1)
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"Coingecko HTTP 错误: {e.response.status_code}")
+            return {}
+        except Exception as e:
+            logger.error(f"Coingecko 获取价格失败: {e}")
+            return {}
+    
+    logger.error(f"Coingecko 获取价格失败，已重试 {API_RETRY_TIMES} 次")
+    return {}
 
 
 def build_pair_crosscheck_text(status: dict) -> str:
@@ -819,34 +1041,49 @@ def auto_collect_stablecoin_pairs(
 
 # ========== 数据获取与逻辑层 ==========
 
+@cached(ttl=PRICE_CACHE_TTL)
 def get_dex_price_from_dexscreener(chain: str, pair_address: str) -> float | None:
     """
     从 DexScreener 获取某条链上某个交易对的价格（priceUsd）。
-    文档示例：
-      https://api.dexscreener.com/latest/dex/pairs/{chain}/{pairAddress}
+    带缓存，减少 API 调用。
+    文档示例：https://api.dexscreener.com/latest/dex/pairs/{chain}/{pairAddress}
     """
     url = f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{pair_address}"
-    try:
-        resp = requests.get(url, timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
+    
+    for attempt in range(API_RETRY_TIMES):
+        try:
+            resp = requests.get(url, timeout=API_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
 
-        pairs = data.get("pairs")
-        if not pairs:
-            print(f"[警告] DexScreener 无数据: chain={chain}, pair={pair_address}")
+            pairs = data.get("pairs")
+            if not pairs:
+                logger.warning(f"DexScreener 无数据: chain={chain}, pair={pair_address}")
+                return None
+
+            price_usd = pairs[0].get("priceUsd")
+            if price_usd is None:
+                logger.warning(f"缺少 priceUsd 字段: chain={chain}, pair={pair_address}")
+                return None
+
+            return float(price_usd)
+            
+        except requests.exceptions.Timeout:
+            logger.warning(f"API 超时 (尝试 {attempt + 1}/{API_RETRY_TIMES}): {url}")
+            if attempt < API_RETRY_TIMES - 1:
+                time.sleep(1)  # 重试前等待
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP 错误: {e.response.status_code} - {url}")
             return None
-
-        price_usd = pairs[0].get("priceUsd")
-        if price_usd is None:
-            print(f"[警告] 缺少 priceUsd 字段: chain={chain}, pair={pair_address}")
+        except Exception as e:
+            logger.error(f"获取 DEX 价格失败: chain={chain}, pair={pair_address}, err={e}")
             return None
-
-        return float(price_usd)
-    except Exception as e:
-        print(f"[错误] 获取 DEX 价格失败: chain={chain}, pair={pair_address}, err={e}")
-        return None
+    
+    logger.error(f"获取价格失败，已重试 {API_RETRY_TIMES} 次: {url}")
+    return None
 
 
+@cached(ttl=PRICE_CACHE_TTL)
 def get_dex_price_and_stable_token(
     chain: str, pair_address: str
 ) -> tuple[
@@ -859,80 +1096,90 @@ def get_dex_price_and_stable_token(
 ]:
     """
     从 DexScreener 获取价格 + 推断出的稳定币 token 地址 & 符号。
-    仅对主流稳定币（USDT/USDC/DAI 等）做符号判断，其它情况会退化为简单选择 quoteToken。
-    额外返回：
-      - pool_rate: 在当前池子里，1 个稳定币大约等于多少个对手盘稳定币（counter token）
-      - counter_symbol: 对手盘 token 的符号
+    带缓存，减少 API 调用。
     """
     url = f"https://api.dexscreener.com/latest/dex/pairs/{chain}/{pair_address}"
-    try:
-        resp = requests.get(url, timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
-
-        pairs = data.get("pairs")
-        if not pairs:
-            print(f"[警告] DexScreener 无数据: chain={chain}, pair={pair_address}")
-            return None, None, None, None, None
-
-        pair0 = pairs[0]
-        price_usd = pair0.get("priceUsd")
-        if price_usd is None:
-            print(f"[警告] 缺少 priceUsd 字段: chain={chain}, pair={pair_address}")
-            return None, None, None, None, None
-
-        base = pair0.get("baseToken") or {}
-        quote = pair0.get("quoteToken") or {}
-        base_symbol = str(base.get("symbol") or "").upper()
-        quote_symbol = str(quote.get("symbol") or "").upper()
-
-        liquidity = pair0.get("liquidity") or {}
-        liq_base = liquidity.get("base")
-        liq_quote = liquidity.get("quote")
-
-        # 优先按主流稳定币来决定"主监控侧"和"对手盘侧"
-        # 注意：后续在 fetch_all_stable_status 中会识别两侧的所有 token，不限于主流稳定币
-        if base_symbol in STABLE_SYMBOLS:
-            stable_token = base
-            counter_token = quote
-            stable_reserve = liq_base
-            counter_reserve = liq_quote
-        elif quote_symbol in STABLE_SYMBOLS:
-            stable_token = quote
-            counter_token = base
-            stable_reserve = liq_quote
-            counter_reserve = liq_base
-        else:
-            # 都不是典型稳定币时，默认使用 quoteToken 作为"主监控侧"，baseToken 作为"对手盘侧"
-            # 后续会识别两侧，所以这里的区分不影响最终结果
-            stable_token = quote or base
-            counter_token = base if stable_token is quote else quote
-            stable_reserve = liq_quote if stable_token is quote else liq_base
-            counter_reserve = liq_base if stable_token is quote else liq_quote
-
-        token_address = stable_token.get("address")
-        token_symbol = stable_token.get("symbol")
-        counter_symbol = counter_token.get("symbol")
-        counter_address = counter_token.get("address")
-
-        pool_rate = None
+    
+    for attempt in range(API_RETRY_TIMES):
         try:
-            if stable_reserve and counter_reserve and stable_reserve > 0:
-                pool_rate = float(counter_reserve) / float(stable_reserve)
-        except Exception:
-            pool_rate = None
+            resp = requests.get(url, timeout=API_TIMEOUT)
+            resp.raise_for_status()
+            data = resp.json()
 
-        return (
-            float(price_usd),
-            token_address,
-            token_symbol,
-            pool_rate,
-            counter_symbol,
-            counter_address,
-        )
-    except Exception as e:
-        print(f"[错误] 获取 DEX 价格失败: chain={chain}, pair={pair_address}, err={e}")
-        return None, None, None, None, None, None
+            pairs = data.get("pairs")
+            if not pairs:
+                logger.warning(f"DexScreener 无数据: chain={chain}, pair={pair_address}")
+                return None, None, None, None, None, None
+
+            pair0 = pairs[0]
+            price_usd = pair0.get("priceUsd")
+            if price_usd is None:
+                logger.warning(f"缺少 priceUsd 字段: chain={chain}, pair={pair_address}")
+                return None, None, None, None, None, None
+
+            base = pair0.get("baseToken") or {}
+            quote = pair0.get("quoteToken") or {}
+            base_symbol = str(base.get("symbol") or "").upper()
+            quote_symbol = str(quote.get("symbol") or "").upper()
+
+            liquidity = pair0.get("liquidity") or {}
+            liq_base = liquidity.get("base")
+            liq_quote = liquidity.get("quote")
+
+            # 优先按主流稳定币来决定"主监控侧"和"对手盘侧"
+            # 注意：后续在 fetch_all_stable_status 中会识别两侧的所有 token，不限于主流稳定币
+            if base_symbol in STABLE_SYMBOLS:
+                stable_token = base
+                counter_token = quote
+                stable_reserve = liq_base
+                counter_reserve = liq_quote
+            elif quote_symbol in STABLE_SYMBOLS:
+                stable_token = quote
+                counter_token = base
+                stable_reserve = liq_quote
+                counter_reserve = liq_base
+            else:
+                # 都不是典型稳定币时，默认使用 quoteToken 作为"主监控侧"，baseToken 作为"对手盘侧"
+                # 后续会识别两侧，所以这里的区分不影响最终结果
+                stable_token = quote or base
+                counter_token = base if stable_token is quote else quote
+                stable_reserve = liq_quote if stable_token is quote else liq_base
+                counter_reserve = liq_base if stable_token is quote else liq_quote
+
+            token_address = stable_token.get("address")
+            token_symbol = stable_token.get("symbol")
+            counter_symbol = counter_token.get("symbol")
+            counter_address = counter_token.get("address")
+
+            pool_rate = None
+            try:
+                if stable_reserve and counter_reserve and stable_reserve > 0:
+                    pool_rate = float(counter_reserve) / float(stable_reserve)
+            except Exception:
+                pool_rate = None
+
+            return (
+                float(price_usd),
+                token_address,
+                token_symbol,
+                pool_rate,
+                counter_symbol,
+                counter_address,
+            )
+            
+        except requests.exceptions.Timeout:
+            logger.warning(f"API 超时 (尝试 {attempt + 1}/{API_RETRY_TIMES}): {url}")
+            if attempt < API_RETRY_TIMES - 1:
+                time.sleep(1)
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP 错误: {e.response.status_code} - {url}")
+            return None, None, None, None, None, None
+        except Exception as e:
+            logger.error(f"获取 DEX 价格失败: chain={chain}, pair={pair_address}, err={e}")
+            return None, None, None, None, None, None
+    
+    logger.error(f"获取价格失败，已重试 {API_RETRY_TIMES} 次: {url}")
+    return None, None, None, None, None, None
 
 
 def _fetch_single_stable_status(
@@ -1073,7 +1320,7 @@ def _fetch_single_stable_status(
 def fetch_all_stable_status(
     configs: list[dict],
     global_threshold: float | None = None,
-    max_workers: int = 10,
+    max_workers: int | None = None,
 ):
     """
     获取给定配置列表里所有稳定币当前状态（使用并发优化性能）。
@@ -1090,20 +1337,30 @@ def fetch_all_stable_status(
     参数:
         configs: 配置列表
         global_threshold: 全局阈值
-        max_workers: 最大并发数（默认10，可根据API限制调整）
+        max_workers: 最大并发数（默认根据配置数量动态调整）
     """
     if not configs:
+        logger.warning("没有配置需要获取")
         return []
+    
+    # 动态调整并发数
+    if max_workers is None:
+        max_workers = min(MAX_CONCURRENT_REQUESTS, max(1, len(configs) // 2))
+    
+    logger.info(f"开始获取 {len(configs)} 个配置的状态，并发数: {max_workers}")
     
     # 如果配置数量较少，使用顺序执行（避免并发开销）
     if len(configs) <= 5:
         results: list[dict] = []
         for cfg in configs:
             results.extend(_fetch_single_stable_status(cfg, global_threshold))
+        logger.info(f"顺序执行完成，获取到 {len(results)} 条状态数据")
         return results
     
     # 使用线程池并发执行
     all_results: list[dict] = []
+    start_time = time.time()
+    
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # 提交所有任务
         future_to_cfg = {
@@ -1112,13 +1369,19 @@ def fetch_all_stable_status(
         }
         
         # 收集结果
+        completed = 0
         for future in as_completed(future_to_cfg):
             cfg = future_to_cfg[future]
+            completed += 1
             try:
                 result = future.result()
                 all_results.extend(result)
+                logger.debug(f"进度: {completed}/{len(configs)} - {cfg.get('chain')}/{cfg.get('name')}")
             except Exception as e:
-                print(f"[错误] 获取配置结果失败: chain={cfg.get('chain')}, pair={cfg.get('pair_address')}, err={e}")
+                logger.error(f"获取配置结果失败: chain={cfg.get('chain')}, pair={cfg.get('pair_address')}, err={e}")
+    
+    elapsed = time.time() - start_time
+    logger.info(f"并发执行完成，耗时 {elapsed:.2f}秒，获取到 {len(all_results)} 条状态数据")
     
     return all_results
 
@@ -1932,10 +2195,12 @@ def run_cli_monitor_with_alerts():
     - 单个稳定币是否脱锚的告警
     - 同一稳定币在多链之间的跨链套利机会告警（已扣除成本）
     """
-    print("多链稳定币脱锚 & 跨链套利监控（CLI 模式）启动")
-    print("时间（北京时间）:", format_beijing())
-    print("建议在后台长期运行，配合 Telegram 告警使用。")
-    print("按 Ctrl + C 退出\n")
+    logger.info("=" * 60)
+    logger.info("多链稳定币脱锚 & 跨链套利监控（CLI 模式）启动")
+    logger.info(f"启动时间（北京时间）: {format_beijing()}")
+    logger.info("建议在后台长期运行，配合 Telegram 告警使用")
+    logger.info("按 Ctrl + C 退出")
+    logger.info("=" * 60)
 
     # 记录每个 (name, chain) 是否处于脱锚状态
     last_alert_state: dict[str, bool] = {}
@@ -1949,7 +2214,7 @@ def run_cli_monitor_with_alerts():
     # 初次加载配置（后续每轮循环会重新从文件读取一次，支持热更新）
     stable_configs = load_stable_configs()
     if not stable_configs:
-        print("未设置任何稳定币监控配置，请先通过 Streamlit 面板添加后再运行 CLI。")
+        logger.warning("未设置任何稳定币监控配置，请先通过 Streamlit 面板添加后再运行 CLI")
         return
 
     while True:
@@ -1958,7 +2223,7 @@ def run_cli_monitor_with_alerts():
             # 每轮从文件加载一次配置，方便你在面板或手工改 JSON 后，CLI 自动生效
             stable_configs = load_stable_configs()
             if not stable_configs:
-                print("当前没有任何监控配置（stable_configs.json 为空），等待你在面板里添加。")
+                logger.warning("当前没有任何监控配置，等待添加配置")
                 time.sleep(DEFAULT_CHECK_INTERVAL)
                 continue
 
@@ -1966,13 +2231,13 @@ def run_cli_monitor_with_alerts():
                 stable_configs, global_threshold=DEFAULT_THRESHOLD
             )
             if not statuses:
-                print("当前未获取到任何稳定币数据，请检查默认配置或网络。")
+                logger.warning("当前未获取到任何稳定币数据，请检查配置或网络")
                 time.sleep(DEFAULT_CHECK_INTERVAL)
                 continue
 
-            print("-" * 80)
-            print(f"[{format_beijing()}]")
-            print("当前稳定币价格与脱锚情况：")
+            logger.info("-" * 80)
+            logger.info(f"检查时间: {format_beijing()}")
+            logger.info("当前稳定币价格与脱锚情况：")
 
             for s in statuses:
                 name = s["name"]
@@ -1983,11 +2248,16 @@ def run_cli_monitor_with_alerts():
                 is_alert = s["is_alert"]
                 symbol = (s.get("symbol") or "").upper()
 
-                print(
+                status_msg = (
                     f"{name:15s} | 链: {chain:10s} | 价格: {price:.6f} USD | "
                     f"偏离: {dev:+.3f}% | 阈值: ±{threshold:.3f}% | "
-                    f"{'⚠️脱锚' if is_alert else '正常'}"
+                    f"{'⚠️脱锚' if is_alert else '✅正常'}"
                 )
+                
+                if is_alert:
+                    logger.warning(status_msg)
+                else:
+                    logger.info(status_msg)
 
                 # 单币脱锚 Telegram 提醒（只在“刚从正常变为脱锚”时发一次）
                 key_nc = f"{name}_{chain}"
@@ -2021,25 +2291,26 @@ def run_cli_monitor_with_alerts():
             # ========= 跨链套利机会扫描 =========
             opps = find_arbitrage_opportunities(statuses)
             if opps:
-                print("\n检测到潜在跨链套利机会（已按默认成本参数估算）：")
+                logger.info(f"\n🎯 检测到 {len(opps)} 个潜在跨链套利机会（已按默认成本参数估算）：")
                 for opp in opps:
                     cd = opp["cost_detail"]
                     name = opp["name"]
                     cheap_chain = opp["cheap_chain"]
                     rich_chain = opp["rich_chain"]
 
-                    print(
-                        f"- {name}: {cheap_chain} -> {rich_chain} | "
+                    opp_msg = (
+                        f"💰 {name}: {cheap_chain} -> {rich_chain} | "
                         f"买价: {opp['cheap_price']:.6f} | 卖价: {opp['rich_price']:.6f} | "
                         f"价差: {cd['价差百分比']:+.3f}% | "
                         f"预估净利润: ${cd['预估净利润']:.2f} "
                         f"({cd['预估净利润率']:+.3f}%)"
                         + (
-                            f" | 预计盈亏平衡资金规模: ${cd['盈亏平衡资金规模']:.2f}"
+                            f" | 盈亏平衡资金: ${cd['盈亏平衡资金规模']:.2f}"
                             if cd.get("盈亏平衡资金规模") not in (None, 0)
                             else ""
                         )
                     )
+                    logger.info(opp_msg)
 
                     # Telegram 套利机会提醒（对同一机会做时间防抖）
                     key = f"{name}:{cheap_chain}->{rich_chain}"
@@ -2064,11 +2335,12 @@ def run_cli_monitor_with_alerts():
                         total_arb_opps += 1
                         last_arb_alerts[key] = now_ts
             else:
-                print("\n当前未发现达到阈值的跨链套利机会。")
+                logger.info("\n当前未发现达到阈值的跨链套利机会")
 
             # ========= 心跳通知（默认每 3 小时一次） =========
             now_ts = time.time()
             if now_ts - last_heartbeat_ts >= 3 * 3600:
+                logger.info("发送心跳通知...")
                 hb_time = format_beijing()
                 hb_msg = (
                     "[脱锚监控心跳]\n"
@@ -2088,17 +2360,113 @@ def run_cli_monitor_with_alerts():
             time.sleep(sleep_sec)
 
         except KeyboardInterrupt:
-            print("\n已手动停止监控。")
+            logger.info("\n用户手动停止监控")
             break
         except Exception as e:
-            print(f"[主循环错误] {e}")
+            logger.error(f"主循环错误: {e}", exc_info=True)
             time.sleep(DEFAULT_CHECK_INTERVAL)
 
 
 # ========== Streamlit 面板（前端表现层） ==========
 
 def run_streamlit_panel():
-    st.set_page_config(page_title="多链稳定币脱锚监控", layout="wide")
+    st.set_page_config(
+        page_title="多链稳定币脱锚监控",
+        page_icon="🎯",
+        layout="wide",
+        initial_sidebar_state="expanded"
+    )
+    
+    # 自定义 CSS 样式
+    st.markdown("""
+    <style>
+        /* 主题色彩 */
+        :root {
+            --primary-color: #1f77b4;
+            --success-color: #2ecc71;
+            --warning-color: #f39c12;
+            --danger-color: #e74c3c;
+        }
+        
+        /* 标题样式 */
+        .main-title {
+            font-size: 2.5rem;
+            font-weight: bold;
+            background: linear-gradient(120deg, #1f77b4, #2ecc71);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 1rem;
+        }
+        
+        /* 指标卡片 */
+        .metric-card {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+            border-radius: 10px;
+            color: white;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        
+        /* 表格美化 */
+        .dataframe {
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        
+        /* 按钮美化 */
+        .stButton button {
+            border-radius: 8px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+        }
+        
+        .stButton button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        }
+        
+        /* 侧边栏美化 */
+        .css-1d391kg {
+            background: linear-gradient(180deg, #f8f9fa 0%, #e9ecef 100%);
+        }
+        
+        /* 输入框美化 */
+        .stTextInput input, .stNumberInput input {
+            border-radius: 8px;
+            border: 2px solid #e0e0e0;
+            transition: border-color 0.3s ease;
+        }
+        
+        .stTextInput input:focus, .stNumberInput input:focus {
+            border-color: #1f77b4;
+            box-shadow: 0 0 0 3px rgba(31,119,180,0.1);
+        }
+        
+        /* 警告框美化 */
+        .alert-danger {
+            background: linear-gradient(135deg, #ff6b6b 0%, #ee5a6f 100%);
+            color: white;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 10px 0;
+        }
+        
+        .alert-success {
+            background: linear-gradient(135deg, #56ab2f 0%, #a8e063 100%);
+            color: white;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 10px 0;
+        }
+        
+        /* 表格行悬停效果 */
+        .stDataFrame tr:hover {
+            background-color: #f0f7ff !important;
+            transition: background-color 0.2s ease;
+        }
+    </style>
+    """, unsafe_allow_html=True)
     
     # ----- 登录检查 -----
     if not check_login():
@@ -2122,10 +2490,12 @@ def run_streamlit_panel():
                     else:
                         try:
                             config = load_auth_config()
-                            # 生成新密码哈希（使用 SHA256）
-                            new_password_hash = hashlib.sha256(new_password.encode()).hexdigest()
+                            # 生成新密码哈希（使用安全的 PBKDF2）
+                            new_password_hash, new_salt = hash_password_secure(new_password)
                             config["password_hash"] = new_password_hash
+                            config["salt"] = new_salt
                             save_auth_config(config)
+                            logger.info(f"用户 {st.session_state.get('username')} 修改了密码")
                             st.success("密码已修改，请重新登录")
                             # 清除登录状态
                             st.session_state["authentication_status"] = False
@@ -2142,7 +2512,8 @@ def run_streamlit_panel():
                     del st.session_state["username"]
                 st.rerun()
 
-    st.title("多链稳定币脱锚监控面板")
+    st.markdown("<h1 class='main-title'>🎯 多链稳定币脱锚监控面板</h1>", unsafe_allow_html=True)
+    st.markdown("---")
 
     # ----- 初始化 Session State -----
     if "check_interval" not in st.session_state:
@@ -2203,10 +2574,17 @@ def run_streamlit_panel():
             value=st.session_state["lifi_api_key"],
             type="password",
         )
-        st.session_state["lifi_from_address"] = st.text_input(
+        lifi_address_input = st.text_input(
             "LI.FI fromAddress（你的 EVM 钱包地址，仅用于报价，不做交易）",
             value=st.session_state.get("lifi_from_address", ""),
+            help="格式: 0x 开头的 40 位十六进制字符"
         )
+        
+        # 验证地址格式
+        if lifi_address_input and not is_valid_ethereum_address(lifi_address_input):
+            st.warning("⚠️ 地址格式不正确，应为 0x 开头的 42 位十六进制地址")
+        
+        st.session_state["lifi_from_address"] = lifi_address_input
         st.session_state["check_interval"] = st.number_input(
             "刷新间隔（秒）",
             min_value=5,
@@ -2247,18 +2625,27 @@ def run_streamlit_panel():
             save_global_config(gcfg)
 
         # 保存全局配置按钮（包括 LI.FI API Key / fromAddress / UI 配置）
-        if st.button("保存全局配置（包括 LI.FI API Key 和 fromAddress）"):
-            gcfg = {
-                "lifi_api_key": st.session_state.get("lifi_api_key", ""),
-                "lifi_from_address": st.session_state.get("lifi_from_address", ""),
-                "ui_config": {
-                    "global_threshold": st.session_state.get("global_threshold", DEFAULT_THRESHOLD),
-                    "selected_symbols": st.session_state.get("selected_symbols", []),
+        col_save, col_clear = st.columns(2)
+        with col_save:
+            if st.button("💾 保存全局配置", use_container_width=True):
+                gcfg = {
+                    "lifi_api_key": st.session_state.get("lifi_api_key", ""),
+                    "lifi_from_address": st.session_state.get("lifi_from_address", ""),
+                    "ui_config": {
+                        "global_threshold": st.session_state.get("global_threshold", DEFAULT_THRESHOLD),
+                        "selected_symbols": st.session_state.get("selected_symbols", []),
+                    }
                 }
-            }
-            save_global_config(gcfg)
-            st.session_state["saved_global_threshold"] = gcfg["ui_config"]["global_threshold"]
-            st.success(f"全局配置已保存到 {GLOBAL_CONFIG_FILE}。")
+                save_global_config(gcfg)
+                st.session_state["saved_global_threshold"] = gcfg["ui_config"]["global_threshold"]
+                st.success(f"全局配置已保存到 {GLOBAL_CONFIG_FILE}。")
+        
+        with col_clear:
+            if st.button("🗑️ 清除缓存", use_container_width=True, help="清除 API 缓存，强制重新获取数据"):
+                _global_cache.clear()
+                st.success("缓存已清除")
+                logger.info("用户手动清除了缓存")
+                st.rerun()
 
         st.markdown("---")
         st.subheader("跨链套利参数（面板展示用）")
@@ -2864,17 +3251,56 @@ def run_streamlit_panel():
     df_display["is_alert"] = df_display["is_alert"].map(lambda x: "是" if x else "否")
 
     alert_count = (df["is_alert"]).sum()
-    col1, col2, col3 = st.columns(3)
-    col1.metric("当前告警稳定币数量", int(alert_count))
-    col2.metric("当前监控总数", int(len(df)))
-    col3.metric(
-        "最大偏离(绝对值)",
-        f"{df['deviation_pct'].abs().max():.3f}%",
-    )
+    
+    # 缓存统计
+    cache_stats = _global_cache.get_stats()
+    
+    # 美化的指标卡片
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.markdown(f"""
+        <div style='background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                    padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);'>
+            <div style='color: white; font-size: 14px; opacity: 0.9;'>⚠️ 当前告警数量</div>
+            <div style='color: white; font-size: 32px; font-weight: bold; margin-top: 5px;'>{int(alert_count)}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col2:
+        st.markdown(f"""
+        <div style='background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); 
+                    padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);'>
+            <div style='color: white; font-size: 14px; opacity: 0.9;'>📊 监控总数</div>
+            <div style='color: white; font-size: 32px; font-weight: bold; margin-top: 5px;'>{int(len(df))}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col3:
+        st.markdown(f"""
+        <div style='background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); 
+                    padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);'>
+            <div style='color: white; font-size: 14px; opacity: 0.9;'>📈 最大偏离</div>
+            <div style='color: white; font-size: 32px; font-weight: bold; margin-top: 5px;'>{df['deviation_pct'].abs().max():.3f}%</div>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col4:
+        st.markdown(f"""
+        <div style='background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%); 
+                    padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);'>
+            <div style='color: white; font-size: 14px; opacity: 0.9;'>⚡ 缓存命中率</div>
+            <div style='color: white; font-size: 32px; font-weight: bold; margin-top: 5px;'>{cache_stats["hit_rate"]}</div>
+            <div style='color: white; font-size: 11px; opacity: 0.8; margin-top: 5px;'>
+                命中: {cache_stats['hits']} | 未命中: {cache_stats['misses']}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
     # ----- 当前跨链套利机会（基于面板套利参数） -----
     st.markdown("---")
-    st.subheader("当前跨链套利机会（按面板参数筛选）")
+    st.markdown("### 💰 当前跨链套利机会")
+    st.markdown("智能扫描多链价差，自动计算成本与收益")
 
     arb_opps = find_arbitrage_opportunities(
         statuses,
@@ -2894,16 +3320,52 @@ def run_streamlit_panel():
         medium_profit = [o for o in arb_opps if 10 <= o["cost_detail"]["预估净利润"] <= 100]
         low_profit = [o for o in arb_opps if o["cost_detail"]["预估净利润"] < 10]
         
-        # 红绿灯状态指示
+        # 红绿灯状态指示（优化版）
         col_status1, col_status2, col_status3, col_status4 = st.columns(4)
         with col_status1:
-            st.markdown(f"<div style='text-align:center;padding:10px;background-color:#d4edda;border-radius:5px;'><span style='font-size:20px;'>🟢</span><br><strong>{len(high_profit)}</strong><br>高利润(>$100)</div>", unsafe_allow_html=True)
+            st.markdown(f"""
+            <div style='text-align:center; padding:20px; 
+                        background: linear-gradient(135deg, #56ab2f 0%, #a8e063 100%);
+                        border-radius:12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+                        transition: transform 0.3s ease;'>
+                <span style='font-size:32px;'>🟢</span>
+                <div style='color: white; font-size: 28px; font-weight: bold; margin-top: 10px;'>{len(high_profit)}</div>
+                <div style='color: white; font-size: 14px; opacity: 0.9;'>高利润 (>$100)</div>
+            </div>
+            """, unsafe_allow_html=True)
         with col_status2:
-            st.markdown(f"<div style='text-align:center;padding:10px;background-color:#fff3cd;border-radius:5px;'><span style='font-size:20px;'>🟡</span><br><strong>{len(medium_profit)}</strong><br>中利润($10-$100)</div>", unsafe_allow_html=True)
+            st.markdown(f"""
+            <div style='text-align:center; padding:20px; 
+                        background: linear-gradient(135deg, #f39c12 0%, #f1c40f 100%);
+                        border-radius:12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+                        transition: transform 0.3s ease;'>
+                <span style='font-size:32px;'>🟡</span>
+                <div style='color: white; font-size: 28px; font-weight: bold; margin-top: 10px;'>{len(medium_profit)}</div>
+                <div style='color: white; font-size: 14px; opacity: 0.9;'>中利润 ($10-$100)</div>
+            </div>
+            """, unsafe_allow_html=True)
         with col_status3:
-            st.markdown(f"<div style='text-align:center;padding:10px;background-color:#f8d7da;border-radius:5px;'><span style='font-size:20px;'>🔴</span><br><strong>{len(low_profit)}</strong><br>低利润(<$10)</div>", unsafe_allow_html=True)
+            st.markdown(f"""
+            <div style='text-align:center; padding:20px; 
+                        background: linear-gradient(135deg, #eb3349 0%, #f45c43 100%);
+                        border-radius:12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+                        transition: transform 0.3s ease;'>
+                <span style='font-size:32px;'>🔴</span>
+                <div style='color: white; font-size: 28px; font-weight: bold; margin-top: 10px;'>{len(low_profit)}</div>
+                <div style='color: white; font-size: 14px; opacity: 0.9;'>低利润 (<$10)</div>
+            </div>
+            """, unsafe_allow_html=True)
         with col_status4:
-            st.markdown(f"<div style='text-align:center;padding:10px;background-color:#e7f3ff;border-radius:5px;'><span style='font-size:20px;'>📊</span><br><strong>{len(arb_opps)}</strong><br>总计</div>", unsafe_allow_html=True)
+            st.markdown(f"""
+            <div style='text-align:center; padding:20px; 
+                        background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+                        border-radius:12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+                        transition: transform 0.3s ease;'>
+                <span style='font-size:32px;'>📊</span>
+                <div style='color: white; font-size: 28px; font-weight: bold; margin-top: 10px;'>{len(arb_opps)}</div>
+                <div style='color: white; font-size: 14px; opacity: 0.9;'>总计</div>
+            </div>
+            """, unsafe_allow_html=True)
         
         st.markdown(
             f"<span style='color:green;font-weight:bold;'>当前有 {len(arb_opps)} 条跨链套利机会</span>",
@@ -3017,27 +3479,67 @@ def run_streamlit_panel():
             for _ in row
         ]
 
-    st.subheader("稳定币列表")
+    st.markdown("### 📊 完整数据表格")
+    st.markdown("实时监控所有稳定币状态")
     
-    # 显示稳定币列表，每行带删除按钮
+    # 创建自定义表格，包含删除按钮列
+    # 美化的表头
+    st.markdown("""
+    <div style='background: linear-gradient(90deg, #667eea 0%, #764ba2 100%); 
+                padding: 15px; border-radius: 10px 10px 0 0; margin-top: 20px;'>
+    """, unsafe_allow_html=True)
+    
+    col_headers = st.columns([2, 1.5, 1.5, 1.5, 1.5, 1.5, 1])
+    col_headers[0].markdown("<div style='color: white; font-weight: bold;'>📌 名称</div>", unsafe_allow_html=True)
+    col_headers[1].markdown("<div style='color: white; font-weight: bold;'>⛓️ 链</div>", unsafe_allow_html=True)
+    col_headers[2].markdown("<div style='color: white; font-weight: bold;'>💵 价格(USD)</div>", unsafe_allow_html=True)
+    col_headers[3].markdown("<div style='color: white; font-weight: bold;'>📉 偏离</div>", unsafe_allow_html=True)
+    col_headers[4].markdown("<div style='color: white; font-weight: bold;'>⚙️ 阈值</div>", unsafe_allow_html=True)
+    col_headers[5].markdown("<div style='color: white; font-weight: bold;'>🚨 告警</div>", unsafe_allow_html=True)
+    col_headers[6].markdown("<div style='color: white; font-weight: bold;'>🗑️ 操作</div>", unsafe_allow_html=True)
+    
+    st.markdown("</div>", unsafe_allow_html=True)
+    
+    # 表格内容行（美化版）
     for idx, row in df.iterrows():
-        col_info, col_del = st.columns([10, 1])
-        with col_info:
-            # 根据告警状态设置颜色
-            alert_icon = "⚠️" if row["is_alert"] else "✅"
-            alert_color = "red" if row["is_alert"] else "green"
-            
-            st.markdown(
-                f"<div style='padding:8px;border-left:4px solid {alert_color};margin-bottom:5px;'>"
-                f"<strong>{alert_icon} {row['name']}</strong> ({row['chain']}) | "
-                f"价格: <code>{row['price']:.6f} USD</code> | "
-                f"偏离: <code style='color:{alert_color};'>{row['deviation_pct']:+.3f}%</code> | "
-                f"阈值: ±{row['threshold']:.3f}% | "
-                f"状态: {'<span style=\"color:red;\">告警</span>' if row['is_alert'] else '<span style=\"color:green;\">正常</span>'}"
-                f"</div>",
-                unsafe_allow_html=True
-            )
-        with col_del:
+        # 根据告警状态设置样式
+        if row["is_alert"]:
+            bg_color = "linear-gradient(135deg, #ffcccc 0%, #ffe6e6 100%)"
+            border_color = "#e74c3c"
+            alert_icon = "🔴"
+            alert_text = "告警"
+        else:
+            bg_color = "linear-gradient(135deg, #f8f9fa 0%, #ffffff 100%)"
+            border_color = "#2ecc71"
+            alert_icon = "🟢"
+            alert_text = "正常"
+        
+        st.markdown(f"""
+        <div style='background: {bg_color}; 
+                    border-left: 4px solid {border_color};
+                    padding: 15px;
+                    margin: 8px 0;
+                    border-radius: 8px;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+                    transition: all 0.3s ease;'>
+        """, unsafe_allow_html=True)
+        
+        cols = st.columns([2, 1.5, 1.5, 1.5, 1.5, 1.5, 1])
+        
+        with cols[0]:
+            st.markdown(f"<div style='font-weight: 600;'>{row['name']}</div>", unsafe_allow_html=True)
+        with cols[1]:
+            st.markdown(f"<div><span style='background: #e3f2fd; padding: 3px 8px; border-radius: 4px;'>{row['chain']}</span></div>", unsafe_allow_html=True)
+        with cols[2]:
+            st.markdown(f"<div style='font-family: monospace;'>${row['price']:.6f}</div>", unsafe_allow_html=True)
+        with cols[3]:
+            deviation_color = "#e74c3c" if abs(row['deviation_pct']) >= row['threshold'] else "#2ecc71"
+            st.markdown(f"<div style='color: {deviation_color}; font-weight: bold;'>{row['deviation_pct']:+.3f}%</div>", unsafe_allow_html=True)
+        with cols[4]:
+            st.markdown(f"<div style='color: #95a5a6;'>±{row['threshold']:.3f}%</div>", unsafe_allow_html=True)
+        with cols[5]:
+            st.markdown(f"<div>{alert_icon} {alert_text}</div>", unsafe_allow_html=True)
+        with cols[6]:
             # 找到对应的配置
             matching_configs = [
                 cfg for cfg in st.session_state["stable_configs"]
@@ -3045,7 +3547,12 @@ def run_streamlit_panel():
             ]
             
             if matching_configs:
-                if st.button("🗑️", key=f"delete_stable_{idx}", help=f"删除 {row['name']} ({row['chain']})"):
+                if st.button(
+                    "🗑️",
+                    key=f"delete_stable_{idx}",
+                    help=f"删除 {row['name']} ({row['chain']})",
+                    use_container_width=True
+                ):
                     # 删除匹配的配置
                     configs_to_keep = [
                         cfg for cfg in st.session_state["stable_configs"]
@@ -3053,28 +3560,12 @@ def run_streamlit_panel():
                     ]
                     st.session_state["stable_configs"] = configs_to_keep
                     save_stable_configs(configs_to_keep)
-                    st.success(f"已删除: {row['name']} ({row['chain']})")
+                    st.success(f"✅ 已删除: {row['name']} ({row['chain']})")
                     st.rerun()
             else:
                 st.caption("无配置")
-    
-    # 可选：也显示完整的数据表格（折叠）
-    with st.expander("📊 查看完整数据表格"):
-        st.dataframe(
-            df_display[["name", "chain", "price", "deviation_pct", "threshold", "is_alert"]]
-            .rename(
-                columns={
-                    "name": "名称",
-                    "chain": "链",
-                    "price": "价格(USD)",
-                    "deviation_pct": "偏离",
-                    "threshold": "阈值",
-                    "is_alert": "告警",
-                }
-            )
-            .style.apply(highlight, axis=1),
-            width="stretch",
-        )
+        
+        st.markdown("</div>", unsafe_allow_html=True)
 
     # ----- 仪表 & 曲线 -----
     # 更新历史数据
@@ -3094,13 +3585,23 @@ def run_streamlit_panel():
         ]
     )
     history_df = pd.concat([history_df, new_rows], ignore_index=True)
-    # 只保留最近 1000 条，防止无限增长
-    if len(history_df) > 1000:
-        history_df = history_df.iloc[-1000:]
+    
+    # 数据清理策略：保留最近 HISTORY_MAX_RECORDS 条或最近 24 小时的数据
+    if len(history_df) > HISTORY_MAX_RECORDS:
+        # 方法1：按数量限制
+        history_df = history_df.iloc[-HISTORY_MAX_RECORDS:]
+        logger.debug(f"历史数据已清理，保留最近 {HISTORY_MAX_RECORDS} 条")
+    
+    # 方法2：按时间窗口清理（可选，取消注释启用）
+    # cutoff_time = now_ts - pd.Timedelta(hours=24)
+    # history_df = history_df[history_df['timestamp'] >= cutoff_time]
+    
     st.session_state["history"] = history_df
+    logger.debug(f"历史数据已更新，当前 {len(history_df)} 条记录")
 
     st.markdown("---")
-    st.subheader("关键稳定币仪表")
+    st.markdown("### 🎛️ 关键稳定币仪表")
+    st.markdown("按偏离度排序，实时监控重点币种")
     
     # 按偏离度排序，显示所有稳定币（优化：限制显示数量，避免卡顿）
     max_display = min(20, len(df))  # 最多显示20个，避免页面卡顿
@@ -3136,7 +3637,8 @@ def run_streamlit_panel():
     if len(df) > max_display:
         st.caption(f"显示前 {max_display} 个偏离度最大的稳定币（共 {len(df)} 个）")
 
-    st.subheader("价格 vs 1 美金 对比曲线")
+    st.markdown("### 📈 价格 vs 1 美金 对比曲线")
+    st.markdown("多链价格趋势分析，支持交互式缩放")
     symbols_available = sorted(
         { (s.get("symbol") or "").upper() for s in statuses if s.get("symbol") }
     )
@@ -3202,7 +3704,8 @@ def run_streamlit_panel():
             st.plotly_chart(fig, width="stretch")
 
     st.markdown("---")
-    st.subheader("跨链套利成本计算器")
+    st.markdown("### 🧮 跨链套利成本计算器")
+    st.markdown("精确计算套利成本，支持自动获取 Gas 价格")
 
     # 选择源链和目标链（基于当前监控项）
     names_for_calc = [f"{s['name']} ({s['chain']})" for s in statuses]
