@@ -249,7 +249,7 @@ if not os.path.exists(CONFIG_DIR):
 # API 配置（性能优化）
 API_TIMEOUT = 10  # API 请求超时（秒）
 API_RETRY_TIMES = 3  # API 重试次数
-MAX_CONCURRENT_REQUESTS = 20  # 最大并发请求数（提升到20以加快多链价格获取）
+MAX_CONCURRENT_REQUESTS = 5  # 最大并发请求数（降低到5避免触发限流）
 
 # 缓存配置（分级策略）
 CACHE_TTL_PRICE = 5  # 价格缓存时间（秒）- 短缓存以捕获套利机会
@@ -327,13 +327,32 @@ LI_FI_COMMONLY_SUPPORTED_CHAINS: set[str] = {
 
 # 主流稳定币符号 -> Coingecko ID 映射（用于全局参考价校验）
 STABLE_SYMBOL_TO_COINGECKO_ID: dict[str, str] = {
+    # 传统法币抵押型
     "USDT": "tether",
     "USDC": "usd-coin",
-    "DAI": "dai",
-    "USDD": "usdd",
+    "BUSD": "binance-usd",
     "TUSD": "true-usd",
     "USDP": "pax-dollar",
-    "BUSD": "binance-usd",
+    "GUSD": "gemini-dollar",
+    "PYUSD": "paypal-usd",
+    "FDUSD": "first-digital-usd",
+    
+    # 去中心化/算法型
+    "DAI": "dai",
+    "FRAX": "frax",
+    "LUSD": "liquity-usd",
+    "GHO": "gho",
+    "CRVUSD": "crvusd",
+    "MIM": "magic-internet-money",
+    "SUSD": "nusd",
+    "DOLA": "dola-usd",
+    "MAI": "mimatic",
+    
+    # 新兴/合成型
+    "USD0": "usd0",
+    "USDD": "usdd",
+    "USDE": "ethena-usde",
+    "USDe": "ethena-usde",  # USDe 和 USDE 指向同一个
 }
 
 # 主流稳定币符号集合，便于在交易对中识别两侧稳定币
@@ -1095,13 +1114,36 @@ def get_dex_price_from_dexscreener(chain: str, pair_address: str) -> float | Non
         except requests.exceptions.Timeout:
             logger.warning(f"API 超时 (尝试 {attempt + 1}/{API_RETRY_TIMES}): {url}")
             if attempt < API_RETRY_TIMES - 1:
-                time.sleep(1)  # 重试前等待
+                wait_time = 2 ** attempt
+                logger.info(f"等待 {wait_time} 秒后重试...")
+                time.sleep(wait_time)
+        except (requests.exceptions.ConnectionError, ConnectionResetError, ConnectionAbortedError) as e:
+            logger.warning(f"连接错误 (尝试 {attempt + 1}/{API_RETRY_TIMES}): {type(e).__name__} - {url}")
+            if attempt < API_RETRY_TIMES - 1:
+                wait_time = 2 ** (attempt + 1)
+                logger.info(f"检测到连接重置，可能触发限流，等待 {wait_time} 秒后重试...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"连接持续失败: chain={chain}, pair={pair_address}, err={e}")
+                return None
         except requests.exceptions.HTTPError as e:
-            logger.error(f"HTTP 错误: {e.response.status_code} - {url}")
-            return None
+            status_code = e.response.status_code
+            if status_code == 429:
+                logger.warning(f"API 限流 (429) - (尝试 {attempt + 1}/{API_RETRY_TIMES}): {url}")
+                if attempt < API_RETRY_TIMES - 1:
+                    wait_time = 5 * (2 ** attempt)
+                    logger.info(f"触发限流，等待 {wait_time} 秒后重试...")
+                    time.sleep(wait_time)
+            else:
+                logger.error(f"HTTP 错误: {status_code} - {url}")
+                return None
         except Exception as e:
-            logger.error(f"获取 DEX 价格失败: chain={chain}, pair={pair_address}, err={e}")
-            return None
+            logger.error(f"获取 DEX 价格失败: chain={chain}, pair={pair_address}, err={type(e).__name__}: {e}")
+            if attempt < API_RETRY_TIMES - 1:
+                wait_time = 2 ** attempt
+                time.sleep(wait_time)
+            else:
+                return None
     
     logger.error(f"获取价格失败，已重试 {API_RETRY_TIMES} 次: {url}")
     return None
@@ -1194,13 +1236,40 @@ def get_dex_price_and_stable_token(
         except requests.exceptions.Timeout:
             logger.warning(f"API 超时 (尝试 {attempt + 1}/{API_RETRY_TIMES}): {url}")
             if attempt < API_RETRY_TIMES - 1:
-                time.sleep(1)
+                # 指数退避：每次重试等待时间递增
+                wait_time = 2 ** attempt  # 1s, 2s, 4s...
+                logger.info(f"等待 {wait_time} 秒后重试...")
+                time.sleep(wait_time)
+        except (requests.exceptions.ConnectionError, ConnectionResetError, ConnectionAbortedError) as e:
+            # 连接错误：网络问题或被限流
+            logger.warning(f"连接错误 (尝试 {attempt + 1}/{API_RETRY_TIMES}): {type(e).__name__} - {url}")
+            if attempt < API_RETRY_TIMES - 1:
+                # 指数退避 + 额外延迟（连接问题可能是限流）
+                wait_time = 2 ** (attempt + 1)  # 2s, 4s, 8s...
+                logger.info(f"检测到连接重置，可能触发限流，等待 {wait_time} 秒后重试...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"连接持续失败: chain={chain}, pair={pair_address}, err={e}")
+                return None, None, None, None, None, None
         except requests.exceptions.HTTPError as e:
-            logger.error(f"HTTP 错误: {e.response.status_code} - {url}")
-            return None, None, None, None, None, None
+            status_code = e.response.status_code
+            if status_code == 429:  # Too Many Requests
+                logger.warning(f"API 限流 (429) - (尝试 {attempt + 1}/{API_RETRY_TIMES}): {url}")
+                if attempt < API_RETRY_TIMES - 1:
+                    wait_time = 5 * (2 ** attempt)  # 5s, 10s, 20s...
+                    logger.info(f"触发限流，等待 {wait_time} 秒后重试...")
+                    time.sleep(wait_time)
+            else:
+                logger.error(f"HTTP 错误: {status_code} - {url}")
+                return None, None, None, None, None, None
         except Exception as e:
-            logger.error(f"获取 DEX 价格失败: chain={chain}, pair={pair_address}, err={e}")
-            return None, None, None, None, None, None
+            logger.error(f"获取 DEX 价格失败: chain={chain}, pair={pair_address}, err={type(e).__name__}: {e}")
+            if attempt < API_RETRY_TIMES - 1:
+                wait_time = 2 ** attempt
+                logger.info(f"未知错误，等待 {wait_time} 秒后重试...")
+                time.sleep(wait_time)
+            else:
+                return None, None, None, None, None, None
     
     logger.error(f"获取价格失败，已重试 {API_RETRY_TIMES} 次: {url}")
     return None, None, None, None, None, None
@@ -2175,6 +2244,33 @@ def can_send_today() -> bool:
     return get_today_send_count() < MAX_DAILY_SENDS
 
 
+def should_send_heartbeat() -> bool:
+    """
+    检查是否应该发送心跳（每天 12:00 固定时间）
+    返回 True 表示现在应该发送
+    """
+    now = now_beijing()
+    current_hour = now.hour
+    current_minute = now.minute
+    
+    # 检查是否在 12:00-12:30 之间
+    if not (current_hour == 12 and 0 <= current_minute < 30):
+        return False
+    
+    # 检查今天是否已发送过心跳
+    logs = load_send_log()
+    today = now.strftime("%Y-%m-%d")
+    
+    # 查找今天的心跳发送记录
+    for log in reversed(logs):  # 从最新的开始查
+        log_time = log.get("time", "")
+        if log_time.startswith(today):
+            if log.get("type") == "心跳" and log.get("success"):
+                return False  # 今天已发送过
+    
+    return True  # 今天未发送且在时间窗口内
+
+
 def send_telegram(text: str, bot_token: str, chat_id: str):
     if not bot_token or not chat_id:
         return
@@ -2480,29 +2576,27 @@ def run_cli_monitor_with_alerts():
             else:
                 logger.info("\n当前未发现达到阈值的跨链套利机会")
 
-            # ========= 心跳通知（每天5次，24/5=4.8小时） =========
-            now_ts = time.time()
-            if now_ts - last_heartbeat_ts >= HEARTBEAT_INTERVAL:
+            # ========= 心跳通知（每天 12:00 固定时间） =========
+            if should_send_heartbeat():
                 if can_send_today():
-                    logger.info("发送心跳通知...")
+                    logger.info("⏰ 到达固定心跳时间 (12:00)，发送心跳通知...")
                     hb_time = format_beijing()
                     today_count = get_today_send_count()
                     remaining = MAX_DAILY_SENDS - today_count
                     hb_msg = (
-                        "[脱锚监控心跳]\n"
-                        f"时间: {hb_time}\n"
-                        f"当前监控稳定币池数量: {len(statuses)}\n"
-                        f"本次循环检测到的脱锚数量: "
+                        "[脱锚监控心跳 - 每日定时]\n"
+                        f"⏰ 时间: {hb_time}\n"
+                        f"📊 当前监控稳定币池数量: {len(statuses)}\n"
+                        f"⚠️ 本次循环检测到的脱锚数量: "
                         f"{sum(1 for s in statuses if s['is_alert'])}\n"
-                        f"累计脱锚告警次数: {total_alerts}\n"
-                        f"累计跨链套利机会通知次数: {total_arb_opps}\n"
-                        f"今日已发送: {today_count}/{MAX_DAILY_SENDS} 条，剩余: {remaining} 条"
+                        f"📈 累计脱锚告警次数: {total_alerts}\n"
+                        f"💰 累计跨链套利机会通知次数: {total_arb_opps}\n"
+                        f"📤 今日已发送: {today_count}/{MAX_DAILY_SENDS} 条，剩余: {remaining} 条"
                     )
                     send_all_notifications(hb_msg, msg_type="心跳")
-                    last_heartbeat_ts = now_ts
+                    logger.info("✅ 心跳发送成功")
                 else:
-                    logger.info(f"今日发送额度已用完({MAX_DAILY_SENDS}条)，跳过心跳")
-                    last_heartbeat_ts = now_ts  # 仍然更新时间，避免频繁检查
+                    logger.warning(f"⚠️ 今日发送额度已用完({MAX_DAILY_SENDS}条)，跳过心跳")
 
             # ========= 控制循环频率 =========
             elapsed = time.time() - loop_start
@@ -2960,10 +3054,11 @@ def run_streamlit_panel():
         if "collected_pairs_cache" not in st.session_state:
             st.session_state["collected_pairs_cache"] = []
         if "available_chains" not in st.session_state:
-            st.session_state["available_chains"] = []
+            # 第一次初始化时，直接使用已知的链列表（不为空）
+            st.session_state["available_chains"] = list(CHAIN_NAME_TO_ID.keys())
         
-        # 从 API 获取支持的链列表
-        if st.button("🔄 刷新链列表", help="从 DexScreener API 获取最新支持的链列表"):
+        # 从 API 获取支持的链列表（可选，用于获取最新的链）
+        if st.button("🔄 刷新链列表", help="从 DexScreener API 获取最新支持的链列表（可能发现更多新链）"):
             with st.spinner("正在从 API 获取支持的链列表..."):
                 try:
                     chains = get_available_chains_from_api()
@@ -2971,12 +3066,7 @@ def run_streamlit_panel():
                     st.success(f"已获取 {len(chains)} 条链")
                 except Exception as e:
                     st.error(f"获取链列表失败: {e}")
-                    # 失败时使用默认链列表
-                    st.session_state["available_chains"] = list(CHAIN_NAME_TO_ID.keys())
-        else:
-            # 如果没有缓存，使用默认链列表
-            if not st.session_state["available_chains"]:
-                st.session_state["available_chains"] = list(CHAIN_NAME_TO_ID.keys())
+                    # 失败时保持当前链列表不变
         
         # 获取所有稳定币符号（包括自定义）
         all_stable_symbols = get_all_stable_symbols()
@@ -3019,8 +3109,8 @@ def run_streamlit_panel():
         if "auto_symbols_selected" not in st.session_state:
             st.session_state["auto_symbols_selected"] = ["USDT", "USDC"] if "USDT" in all_stable_symbols and "USDC" in all_stable_symbols else []
         if "auto_chains_selected" not in st.session_state:
-            default_chains = ["ethereum", "bsc", "arbitrum", "base", "polygon"] if any(c in st.session_state["available_chains"] for c in ["ethereum", "bsc", "arbitrum", "base", "polygon"]) else []
-            st.session_state["auto_chains_selected"] = default_chains
+            # 默认选择所有 API 返回的链（不硬编码）
+            st.session_state["auto_chains_selected"] = st.session_state["available_chains"]
         
         # 稳定币选择器（带全选功能）
         with col_auto1:
@@ -3690,20 +3780,48 @@ def run_streamlit_panel():
     # 价格异常检测
     suspicious_items = df[((df['price'] > 2.0) | (df['price'] < 0.5))]
     if len(suspicious_items) > 0:
-        st.warning(f"⚠️ 检测到 {len(suspicious_items)} 个价格异常的项目（可能不是稳定币）：")
+        st.error(f"⚠️ 检测到 {len(suspicious_items)} 个价格异常的项目（可能不是稳定币）！")
+        
+        # 一键清理所有异常
+        col_warn, col_clean = st.columns([3, 1])
+        with col_warn:
+            st.write("**建议立即清理，这些可能是误添加的非稳定币（如ETH、BTC等）**")
+        with col_clean:
+            if st.button("🗑️ 一键清理所有异常", type="primary", use_container_width=True):
+                # 收集所有异常项的 (name, chain)
+                items_to_remove = set()
+                for _, item in suspicious_items.iterrows():
+                    items_to_remove.add((item['name'], item['chain']))
+                
+                # 从配置中删除
+                configs_to_keep = [
+                    cfg for cfg in st.session_state["stable_configs"]
+                    if (cfg.get("name"), cfg.get("chain")) not in items_to_remove
+                ]
+                
+                removed_count = len(st.session_state["stable_configs"]) - len(configs_to_keep)
+                st.session_state["stable_configs"] = configs_to_keep
+                save_stable_configs(configs_to_keep)
+                
+                st.success(f"✅ 已清理 {removed_count} 个异常配置！")
+                st.rerun()
+        
+        st.markdown("---")
+        
+        # 显示异常项列表
         for idx, item in suspicious_items.iterrows():
             col1, col2 = st.columns([3, 1])
             with col1:
-                st.error(f"**{item['name']} ({item['chain']})** - 价格: ${item['price']:.2f} (正常稳定币应该接近 $1.00)")
+                st.error(f"**{item['name']} ({item['chain']})** - 价格: ${item['price']:.2f}")
             with col2:
-                if st.button(f"🗑️ 立即删除", key=f"del_suspicious_{idx}"):
+                if st.button(f"删除", key=f"del_suspicious_{idx}", use_container_width=True):
                     configs_to_keep = [
                         cfg for cfg in st.session_state["stable_configs"]
                         if not (cfg.get("name") == item["name"] and cfg.get("chain") == item["chain"])
                     ]
                     st.session_state["stable_configs"] = configs_to_keep
                     save_stable_configs(configs_to_keep)
-                    st.success(f"已删除异常项: {item['name']}")
+                    st.success(f"已删除: {item['name']}")
                     st.rerun()
     
     # 调试：显示当前配置
@@ -3722,15 +3840,28 @@ def run_streamlit_panel():
                     "Pair地址": cfg.get("pair_address", "")[:20] + "...",
                 })
             st.dataframe(pd.DataFrame(config_display), use_container_width=True)
+            
+            # 查看原始 JSON
+            if st.checkbox("查看原始 JSON 配置"):
+                st.json(st.session_state['stable_configs'])
         else:
             st.write("配置为空")
         
-        # 重新加载配置按钮
-        if st.button("🔄 从文件重新加载配置"):
-            reloaded = load_stable_configs()
-            st.session_state["stable_configs"] = reloaded
-            st.success(f"已从文件重新加载 {len(reloaded)} 个配置")
-            st.rerun()
+        # 操作按钮
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 从文件重新加载配置"):
+                reloaded = load_stable_configs()
+                st.session_state["stable_configs"] = reloaded
+                st.success(f"已从文件重新加载 {len(reloaded)} 个配置")
+                st.rerun()
+        
+        with col2:
+            if st.button("🗑️ 清空所有配置"):
+                st.session_state["stable_configs"] = []
+                save_stable_configs([])
+                st.success("已清空所有配置")
+                st.rerun()
 
     # ----- 仪表 & 曲线 -----
     # 更新历史数据
