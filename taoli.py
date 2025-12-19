@@ -3616,53 +3616,95 @@ def run_streamlit_panel():
     
     # 删除功能区域（在表格下方）
     st.markdown("---")
-    st.markdown("**🗑️ 删除监控项**（选择要删除的项目）：")
     
-    # 创建删除选项
-    delete_options = [f"{row['name']} ({row['chain']}) - 价格: ${row['price']:.4f}" 
-                      for _, row in df.iterrows()]
+    # 快速删除区域（可折叠）
+    with st.expander("🗑️ 快速删除（点击展开）"):
+        st.caption("直接点击删除，无需重新加载数据")
+        
+        # 使用多列布局显示删除按钮
+        num_cols = 4
+        num_rows = (len(df) + num_cols - 1) // num_cols
+        
+        for row_idx in range(num_rows):
+            cols = st.columns(num_cols)
+            for col_idx in range(num_cols):
+                item_idx = row_idx * num_cols + col_idx
+                if item_idx < len(df):
+                    row = df.iloc[item_idx]
+                    with cols[col_idx]:
+                        # 根据价格判断是否可能是错误的
+                        price = row['price']
+                        is_suspicious = price > 2.0 or price < 0.5  # 稳定币应该接近 $1
+                        
+                        button_label = f"{'⚠️' if is_suspicious else '🗑️'} {row['name']}({row['chain']})"
+                        button_help = f"价格: ${price:.4f}" + (" - 价格异常，可能不是稳定币" if is_suspicious else "")
+                        
+                        if st.button(button_label, key=f"quick_del_{item_idx}", 
+                                   help=button_help, use_container_width=True):
+                            # 快速删除
+                            configs_to_keep = [
+                                cfg for cfg in st.session_state["stable_configs"]
+                                if not (cfg.get("name") == row["name"] and cfg.get("chain") == row["chain"])
+                            ]
+                            st.session_state["stable_configs"] = configs_to_keep
+                            save_stable_configs(configs_to_keep)
+                            st.success(f"✅ 已删除: {row['name']} ({row['chain']})")
+                            st.rerun()
     
-    if delete_options:
-        col_select, col_btn = st.columns([3, 1])
-        with col_select:
-            selected_to_delete = st.selectbox(
-                "选择要删除的监控项",
-                options=delete_options,
-                key="delete_select"
-            )
-        with col_btn:
-            st.write("")  # 占位，对齐按钮
-            if st.button("🗑️ 删除选中项", type="primary", use_container_width=True):
-                # 解析选中的项目
-                selected_idx = delete_options.index(selected_to_delete)
-                row_to_delete = df.iloc[selected_idx]
-                
-                name_to_delete = row_to_delete["name"]
-                chain_to_delete = row_to_delete["chain"]
-                
-                # 调试信息
-                logger.info(f"准备删除: name={name_to_delete}, chain={chain_to_delete}")
-                logger.info(f"删除前配置数量: {len(st.session_state['stable_configs'])}")
-                
-                # 删除配置
-                configs_before = len(st.session_state["stable_configs"])
-                configs_to_keep = [
-                    cfg for cfg in st.session_state["stable_configs"]
-                    if not (cfg.get("name") == name_to_delete and cfg.get("chain") == chain_to_delete)
-                ]
-                configs_after = len(configs_to_keep)
-                
-                logger.info(f"删除后配置数量: {configs_after}, 实际删除: {configs_before - configs_after} 个")
-                
-                # 更新 session 和保存
-                st.session_state["stable_configs"] = configs_to_keep
-                save_stable_configs(configs_to_keep)
-                
-                st.success(f"✅ 已删除: {name_to_delete} ({chain_to_delete}) - 删除了 {configs_before - configs_after} 个配置")
-                time.sleep(0.5)  # 等待保存完成
-                st.rerun()
-    else:
-        st.info("当前没有监控项")
+    # 原来的下拉删除方式（备用）
+    with st.expander("🔽 下拉选择删除"):
+        delete_options = [f"{row['name']} ({row['chain']}) - 价格: ${row['price']:.4f}" 
+                          for _, row in df.iterrows()]
+        
+        if delete_options:
+            col_select, col_btn = st.columns([3, 1])
+            with col_select:
+                selected_to_delete = st.selectbox(
+                    "选择要删除的监控项",
+                    options=delete_options,
+                    key="delete_select"
+                )
+            with col_btn:
+                st.write("")  # 占位，对齐按钮
+                if st.button("🗑️ 删除", type="primary", use_container_width=True):
+                    # 解析选中的项目
+                    selected_idx = delete_options.index(selected_to_delete)
+                    row_to_delete = df.iloc[selected_idx]
+                    
+                    name_to_delete = row_to_delete["name"]
+                    chain_to_delete = row_to_delete["chain"]
+                    
+                    # 删除配置
+                    configs_to_keep = [
+                        cfg for cfg in st.session_state["stable_configs"]
+                        if not (cfg.get("name") == name_to_delete and cfg.get("chain") == chain_to_delete)
+                    ]
+                    
+                    st.session_state["stable_configs"] = configs_to_keep
+                    save_stable_configs(configs_to_keep)
+                    st.success(f"✅ 已删除: {name_to_delete} ({chain_to_delete})")
+                    st.rerun()
+        else:
+            st.info("当前没有监控项")
+    
+    # 价格异常检测
+    suspicious_items = df[((df['price'] > 2.0) | (df['price'] < 0.5))]
+    if len(suspicious_items) > 0:
+        st.warning(f"⚠️ 检测到 {len(suspicious_items)} 个价格异常的项目（可能不是稳定币）：")
+        for idx, item in suspicious_items.iterrows():
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.error(f"**{item['name']} ({item['chain']})** - 价格: ${item['price']:.2f} (正常稳定币应该接近 $1.00)")
+            with col2:
+                if st.button(f"🗑️ 立即删除", key=f"del_suspicious_{idx}"):
+                    configs_to_keep = [
+                        cfg for cfg in st.session_state["stable_configs"]
+                        if not (cfg.get("name") == item["name"] and cfg.get("chain") == item["chain"])
+                    ]
+                    st.session_state["stable_configs"] = configs_to_keep
+                    save_stable_configs(configs_to_keep)
+                    st.success(f"已删除异常项: {item['name']}")
+                    st.rerun()
     
     # 调试：显示当前配置
     with st.expander("🔍 调试信息 - 查看当前配置"):
