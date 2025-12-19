@@ -3018,21 +3018,63 @@ def run_streamlit_panel():
         ]
 
     st.subheader("稳定币列表")
-    st.dataframe(
-        df_display[["name", "chain", "price", "deviation_pct", "threshold", "is_alert"]]
-        .rename(
-            columns={
-                "name": "名称",
-                "chain": "链",
-                "price": "价格(USD)",
-                "deviation_pct": "偏离",
-                "threshold": "阈值",
-                "is_alert": "告警",
-            }
+    
+    # 显示稳定币列表，每行带删除按钮
+    for idx, row in df.iterrows():
+        col_info, col_del = st.columns([10, 1])
+        with col_info:
+            # 根据告警状态设置颜色
+            alert_icon = "⚠️" if row["is_alert"] else "✅"
+            alert_color = "red" if row["is_alert"] else "green"
+            
+            st.markdown(
+                f"<div style='padding:8px;border-left:4px solid {alert_color};margin-bottom:5px;'>"
+                f"<strong>{alert_icon} {row['name']}</strong> ({row['chain']}) | "
+                f"价格: <code>{row['price']:.6f} USD</code> | "
+                f"偏离: <code style='color:{alert_color};'>{row['deviation_pct']:+.3f}%</code> | "
+                f"阈值: ±{row['threshold']:.3f}% | "
+                f"状态: {'<span style=\"color:red;\">告警</span>' if row['is_alert'] else '<span style=\"color:green;\">正常</span>'}"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+        with col_del:
+            # 找到对应的配置
+            matching_configs = [
+                cfg for cfg in st.session_state["stable_configs"]
+                if cfg.get("name") == row["name"] and cfg.get("chain") == row["chain"]
+            ]
+            
+            if matching_configs:
+                if st.button("🗑️", key=f"delete_stable_{idx}", help=f"删除 {row['name']} ({row['chain']})"):
+                    # 删除匹配的配置
+                    configs_to_keep = [
+                        cfg for cfg in st.session_state["stable_configs"]
+                        if not (cfg.get("name") == row["name"] and cfg.get("chain") == row["chain"])
+                    ]
+                    st.session_state["stable_configs"] = configs_to_keep
+                    save_stable_configs(configs_to_keep)
+                    st.success(f"已删除: {row['name']} ({row['chain']})")
+                    st.rerun()
+            else:
+                st.caption("无配置")
+    
+    # 可选：也显示完整的数据表格（折叠）
+    with st.expander("📊 查看完整数据表格"):
+        st.dataframe(
+            df_display[["name", "chain", "price", "deviation_pct", "threshold", "is_alert"]]
+            .rename(
+                columns={
+                    "name": "名称",
+                    "chain": "链",
+                    "price": "价格(USD)",
+                    "deviation_pct": "偏离",
+                    "threshold": "阈值",
+                    "is_alert": "告警",
+                }
+            )
+            .style.apply(highlight, axis=1),
+            width="stretch",
         )
-        .style.apply(highlight, axis=1),
-        width="stretch",
-    )
 
     # ----- 仪表 & 曲线 -----
     # 更新历史数据
