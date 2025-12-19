@@ -2427,22 +2427,29 @@ def run_cli_monitor_with_alerts():
             else:
                 logger.info("\n当前未发现达到阈值的跨链套利机会")
 
-            # ========= 心跳通知（默认每 3 小时一次） =========
+            # ========= 心跳通知（每天5次，24/5=4.8小时） =========
             now_ts = time.time()
-            if now_ts - last_heartbeat_ts >= 3 * 3600:
-                logger.info("发送心跳通知...")
-                hb_time = format_beijing()
-                hb_msg = (
-                    "[脱锚监控心跳]\n"
-                    f"时间: {hb_time}\n"
-                    f"当前监控稳定币池数量: {len(statuses)}\n"
-                    f"本次循环检测到的脱锚数量: "
-                    f"{sum(1 for s in statuses if s['is_alert'])}\n"
-                    f"累计脱锚告警次数: {total_alerts}\n"
-                    f"累计跨链套利机会通知次数: {total_arb_opps}"
-                )
-                send_all_notifications(hb_msg)
-                last_heartbeat_ts = now_ts
+            if now_ts - last_heartbeat_ts >= HEARTBEAT_INTERVAL:
+                if can_send_today():
+                    logger.info("发送心跳通知...")
+                    hb_time = format_beijing()
+                    today_count = get_today_send_count()
+                    remaining = MAX_DAILY_SENDS - today_count
+                    hb_msg = (
+                        "[脱锚监控心跳]\n"
+                        f"时间: {hb_time}\n"
+                        f"当前监控稳定币池数量: {len(statuses)}\n"
+                        f"本次循环检测到的脱锚数量: "
+                        f"{sum(1 for s in statuses if s['is_alert'])}\n"
+                        f"累计脱锚告警次数: {total_alerts}\n"
+                        f"累计跨链套利机会通知次数: {total_arb_opps}\n"
+                        f"今日已发送: {today_count}/{MAX_DAILY_SENDS} 条，剩余: {remaining} 条"
+                    )
+                    send_all_notifications(hb_msg, msg_type="心跳")
+                    last_heartbeat_ts = now_ts
+                else:
+                    logger.info(f"今日发送额度已用完({MAX_DAILY_SENDS}条)，跳过心跳")
+                    last_heartbeat_ts = now_ts  # 仍然更新时间，避免频繁检查
 
             # ========= 控制循环频率 =========
             elapsed = time.time() - loop_start
@@ -3488,62 +3495,69 @@ def run_streamlit_panel():
             for _ in row
         ]
 
-    st.subheader("📊 实时监控数据表格")
+    st.subheader("📊 查看完整数据表格")
     
-    # 自定义表格，每行带删除按钮
-    # 表头
-    cols_header = st.columns([2, 1.5, 2, 1.5, 1.5, 1.5, 1])
-    cols_header[0].markdown("**名称**")
-    cols_header[1].markdown("**链**")
-    cols_header[2].markdown("**价格(USD)**")
-    cols_header[3].markdown("**偏离**")
-    cols_header[4].markdown("**阈值**")
-    cols_header[5].markdown("**告警**")
-    cols_header[6].markdown("**删除**")
-    
-    st.markdown("---")
-    
-    # 表格内容行
-    for idx, row in df.iterrows():
-        # 根据告警状态设置背景色
-        if row["is_alert"]:
-            bg_style = "background-color: #ffcccc; padding: 8px; border-radius: 5px; margin: 2px 0;"
+    # 高亮告警行的函数
+    def highlight_alerts(row):
+        if row["告警"] == "是":
+            return ["background-color: #ffcccc"] * len(row)
         else:
-            bg_style = "background-color: #f8f9fa; padding: 8px; border-radius: 5px; margin: 2px 0;"
-        
-        cols = st.columns([2, 1.5, 2, 1.5, 1.5, 1.5, 1])
-        
-        with cols[0]:
-            st.markdown(f"<div style='{bg_style}'>{row['name']}</div>", unsafe_allow_html=True)
-        with cols[1]:
-            st.markdown(f"<div style='{bg_style}'>{row['chain']}</div>", unsafe_allow_html=True)
-        with cols[2]:
-            st.markdown(f"<div style='{bg_style}'>{row['price']:.6f}</div>", unsafe_allow_html=True)
-        with cols[3]:
-            color = "red" if abs(row['deviation_pct']) >= row['threshold'] else "green"
-            st.markdown(f"<div style='{bg_style} color: {color}; font-weight: bold;'>{row['deviation_pct']:+.3f}%</div>", unsafe_allow_html=True)
-        with cols[4]:
-            st.markdown(f"<div style='{bg_style}'>±{row['threshold']:.3f}%</div>", unsafe_allow_html=True)
-        with cols[5]:
-            alert_text = "⚠️ 是" if row["is_alert"] else "✅ 否"
-            st.markdown(f"<div style='{bg_style}'>{alert_text}</div>", unsafe_allow_html=True)
-        with cols[6]:
-            # 每行的删除按钮
-            matching_configs = [
-                cfg for cfg in st.session_state["stable_configs"]
-                if cfg.get("name") == row["name"] and cfg.get("chain") == row["chain"]
-            ]
-            
-            if matching_configs:
-                if st.button("🗑️", key=f"del_{idx}", help=f"删除 {row['name']} ({row['chain']})"):
-                    configs_to_keep = [
-                        cfg for cfg in st.session_state["stable_configs"]
-                        if not (cfg.get("name") == row["name"] and cfg.get("chain") == row["chain"])
-                    ]
-                    st.session_state["stable_configs"] = configs_to_keep
-                    save_stable_configs(configs_to_keep)
-                    st.success(f"✅ 已删除: {row['name']} ({row['chain']})")
-                    st.rerun()
+            return [""] * len(row)
+    
+    # 准备显示数据
+    df_display_table = df.copy()
+    df_display_table["告警"] = df_display_table["is_alert"].map({True: "是", False: "否"})
+    
+    # 使用原生 dataframe（可排序、可筛选）
+    st.dataframe(
+        df_display_table[["name", "chain", "price", "deviation_pct", "threshold", "告警"]]
+        .rename(columns={
+            "name": "名称",
+            "chain": "链",
+            "price": "价格(USD)",
+            "deviation_pct": "偏离(%)",
+            "threshold": "阈值(%)",
+        })
+        .style.apply(highlight_alerts, axis=1),
+        use_container_width=True,
+        height=400,
+    )
+    
+    # 删除功能区域（在表格下方）
+    st.markdown("---")
+    st.markdown("**🗑️ 删除监控项**（选择要删除的项目）：")
+    
+    # 创建删除选项
+    delete_options = [f"{row['name']} ({row['chain']}) - 价格: ${row['price']:.4f}" 
+                      for _, row in df.iterrows()]
+    
+    if delete_options:
+        col_select, col_btn = st.columns([3, 1])
+        with col_select:
+            selected_to_delete = st.selectbox(
+                "选择要删除的监控项",
+                options=delete_options,
+                key="delete_select"
+            )
+        with col_btn:
+            st.write("")  # 占位，对齐按钮
+            if st.button("🗑️ 删除选中项", type="primary", use_container_width=True):
+                # 解析选中的项目
+                selected_idx = delete_options.index(selected_to_delete)
+                row_to_delete = df.iloc[selected_idx]
+                
+                # 删除配置
+                configs_to_keep = [
+                    cfg for cfg in st.session_state["stable_configs"]
+                    if not (cfg.get("name") == row_to_delete["name"] 
+                           and cfg.get("chain") == row_to_delete["chain"])
+                ]
+                st.session_state["stable_configs"] = configs_to_keep
+                save_stable_configs(configs_to_keep)
+                st.success(f"✅ 已删除: {row_to_delete['name']} ({row_to_delete['chain']})")
+                st.rerun()
+    else:
+        st.info("当前没有监控项")
 
     # ----- 仪表 & 曲线 -----
     # 更新历史数据
@@ -3908,6 +3922,59 @@ def run_streamlit_panel():
             st.warning("在当前参数下，该跨链套利机会**不划算**（成本吃掉了价差）。")
 
     # 面板内不再自动直接发脱锚告警；所有告警/套利/心跳统一由 CLI + 用户管理负责分发。
+    
+    st.markdown("---")
+    st.subheader("📤 发送日志")
+    
+    # 显示今日发送统计
+    today_count = get_today_send_count()
+    remaining = MAX_DAILY_SENDS - today_count
+    
+    col_stat1, col_stat2, col_stat3 = st.columns(3)
+    col_stat1.metric("今日已发送", f"{today_count} 条")
+    col_stat2.metric("剩余额度", f"{remaining} 条")
+    col_stat3.metric("每日限额", f"{MAX_DAILY_SENDS} 条")
+    
+    st.caption(f"💡 心跳间隔: {HEARTBEAT_INTERVAL/3600:.1f} 小时（24小时平均分配）")
+    st.caption("⚠️ 套利/脱锚告警会占用发送额度，心跳会自动调整")
+    
+    # 显示发送日志列表
+    logs = load_send_log()
+    if logs:
+        st.markdown("**最近发送记录：**")
+        
+        # 倒序显示（最新的在前）
+        logs_reversed = list(reversed(logs[-20:]))  # 只显示最近20条
+        
+        for log in logs_reversed:
+            msg_type = log.get("type", "未知")
+            content = log.get("content", "")
+            channels = log.get("channels", [])
+            success = log.get("success", True)
+            time_str = log.get("time", "")
+            
+            # 根据类型设置图标
+            type_icon = {
+                "心跳": "💓",
+                "脱锚告警": "⚠️",
+                "套利机会": "💰",
+                "测试": "🧪"
+            }.get(msg_type, "📨")
+            
+            # 根据成功状态设置颜色
+            status_icon = "✅" if success else "❌"
+            
+            with st.expander(f"{type_icon} {msg_type} - {time_str} {status_icon}"):
+                st.text(content)
+                st.caption(f"发送渠道: {', '.join(channels) if channels else '无'}")
+    else:
+        st.info("暂无发送记录")
+    
+    # 清空日志按钮
+    if st.button("🗑️ 清空发送日志"):
+        save_send_log([])
+        st.success("已清空发送日志")
+        st.rerun()
 
 
 # ========== 入口选择 ==========
