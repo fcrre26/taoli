@@ -25,6 +25,7 @@ ensure_package("requests")
 ensure_package("pandas")
 ensure_package("streamlit")
 ensure_package("plotly")
+ensure_package("streamlit-authenticator")
 
 # 避免在 Streamlit 每次重跑时刷屏，只在非 Streamlit 环境下打印一次提示
 if not os.environ.get("STREAMLIT_SERVER_PORT"):
@@ -38,6 +39,8 @@ import requests  # type: ignore
 import pandas as pd  # type: ignore
 import streamlit as st  # type: ignore
 import plotly.express as px
+import streamlit_authenticator as stauth  # type: ignore
+import hashlib
 
 
 # ========== 配置默认值（最终在面板里调） ==========
@@ -66,6 +69,9 @@ CONFIG_FILE = "stable_configs.json"
 
 # 全局配置文件（目前用于存放 LI.FI 等 API Key）
 GLOBAL_CONFIG_FILE = "global_config.json"
+
+# 登录配置文件
+AUTH_CONFIG_FILE = "auth_config.json"
 
 # 将后续损坏的 CHAIN_NAME_TO_ID 行包裹在多行字符串中，避免语法错误
 _BROKEN_CHAIN_MAPPING = """
@@ -310,6 +316,120 @@ def save_global_config(cfg: dict) -> None:
         print(f"[全局配置] 保存 {GLOBAL_CONFIG_FILE} 失败: {e}")
 
 
+def load_auth_config() -> dict:
+    """
+    加载登录配置（用户名、密码哈希等）。
+    如果文件不存在，创建默认配置。
+    """
+    # 生成默认密码哈希
+    default_password_hash = stauth.Hasher(["admin123"]).generate()[0]  # 默认密码：admin123
+    
+    default_config = {
+        "credentials": {
+            "usernames": {
+                "admin": {
+                    "name": "管理员",
+                    "password": default_password_hash,
+                }
+            }
+        },
+        "cookie": {
+            "expiry_days": 30,
+            "key": "taoli_auth_key_2024",
+            "name": "taoli_auth_cookie",
+        },
+        "preauthorized": {
+            "emails": []
+        }
+    }
+    
+    if os.path.exists(AUTH_CONFIG_FILE):
+        try:
+            with open(AUTH_CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                # 确保必要的字段存在
+                if "credentials" not in data:
+                    data["credentials"] = default_config["credentials"]
+                if "cookie" not in data:
+                    data["cookie"] = default_config["cookie"]
+                if "preauthorized" not in data:
+                    data["preauthorized"] = default_config["preauthorized"]
+                return data
+            else:
+                print(f"[登录配置] {AUTH_CONFIG_FILE} 内容格式异常，使用默认配置。")
+        except Exception as e:
+            print(f"[登录配置] 读取 {AUTH_CONFIG_FILE} 失败: {e}，使用默认配置。")
+    else:
+        # 首次运行，保存默认配置
+        save_auth_config(default_config)
+        print(f"[登录配置] 已创建默认登录配置，默认用户名: admin，默认密码: admin123")
+        print(f"[登录配置] 请及时修改 {AUTH_CONFIG_FILE} 中的密码，或通过面板修改")
+    
+    return default_config
+
+
+def save_auth_config(cfg: dict) -> None:
+    """
+    保存登录配置。
+    """
+    try:
+        with open(AUTH_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        print(f"[登录配置] 已保存到 {AUTH_CONFIG_FILE}。")
+    except Exception as e:
+        print(f"[登录配置] 保存 {AUTH_CONFIG_FILE} 失败: {e}")
+
+
+def check_login() -> bool:
+    """
+    检查用户是否已登录。
+    返回 True 表示已登录，False 表示需要登录。
+    """
+    if "authentication_status" not in st.session_state:
+        st.session_state["authentication_status"] = None
+    if "name" not in st.session_state:
+        st.session_state["name"] = None
+    if "username" not in st.session_state:
+        st.session_state["username"] = None
+    
+    # 如果已经认证，直接返回
+    if st.session_state.get("authentication_status") == True:
+        return True
+    
+    # 加载登录配置
+    config = load_auth_config()
+    
+    # 创建认证器
+    authenticator = stauth.Authenticate(
+        config["credentials"],
+        config["cookie"]["name"],
+        config["cookie"]["key"],
+        config["cookie"]["expiry_days"],
+        config.get("preauthorized", {}),
+    )
+    
+    # 显示登录表单
+    name, authentication_status, username = authenticator.login("登录", "main")
+    
+    if authentication_status == False:
+        st.error("用户名或密码不正确")
+        return False
+    elif authentication_status == None:
+        st.warning("请输入用户名和密码")
+        return False
+    elif authentication_status == True:
+        # 登录成功，保存状态
+        st.session_state["authentication_status"] = True
+        st.session_state["name"] = name
+        st.session_state["username"] = username
+        st.session_state["authenticator"] = authenticator
+        st.session_state["auth_config"] = config
+        return True
+    
+    return False
+
+
 def load_users() -> list[dict]:
     """
     从本地 JSON 文件加载用户配置：
@@ -461,6 +581,228 @@ def parse_dexscreener_input(
 
     # 默认视为纯 pair 地址
     return default_chain, raw
+
+
+def get_available_chains_from_api() -> list[str]:
+    """
+    通过搜索常见交易对，从 DexScreener API 推断支持的链列表。
+    返回链标识列表（小写）。
+    """
+    # 尝试搜索一些常见交易对，从结果中提取所有出现的链
+    test_queries = ["USDT/USDC", "ETH/USDT", "BTC/USDT", "USDC/DAI"]
+    chains_found: set[str] = set()
+    
+    print("[链列表] 正在从 DexScreener API 获取支持的链列表...")
+    for query in test_queries:
+        try:
+            url = "https://api.dexscreener.com/latest/dex/search"
+            resp = requests.get(url, params={"q": query}, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            
+            pairs = data.get("pairs", [])
+            for pair in pairs:
+                chain_id = pair.get("chainId", "").lower()
+                if chain_id:
+                    chains_found.add(chain_id)
+        except Exception as e:
+            print(f"[链列表] 搜索 {query} 时出错: {e}")
+            continue
+    
+    # 如果 API 没有返回足够的链，合并已知的链列表
+    known_chains = set(CHAIN_NAME_TO_ID.keys())
+    chains_found = chains_found.union(known_chains)
+    
+    print(f"[链列表] 找到 {len(chains_found)} 条链")
+    
+    # 按字母顺序排序
+    return sorted(list(chains_found))
+
+
+def search_stablecoin_pairs(
+    stable_symbol: str,
+    chains: list[str] | None = None,
+    min_liquidity_usd: float = 10000.0,
+    max_results_per_chain: int = 5,
+) -> list[dict]:
+    """
+    使用 DexScreener API 自动搜索稳定币交易对。
+    
+    参数:
+        stable_symbol: 稳定币符号（如 "USDT", "USDC"）
+        chains: 要搜索的链列表，如果为 None 则搜索所有支持的链
+        min_liquidity_usd: 最小流动性要求（USD）
+        max_results_per_chain: 每条链最多返回的结果数
+    
+    返回:
+        交易对列表，每项包含：
+        {
+            "chain": "bsc",
+            "pair_address": "0x...",
+            "base_token": {"symbol": "USDT", "address": "0x..."},
+            "quote_token": {"symbol": "USDC", "address": "0x..."},
+            "liquidity_usd": 123456.0,
+            "price_usd": 1.001,
+        }
+    """
+    if chains is None:
+        chains = list(CHAIN_NAME_TO_ID.keys())
+    
+    results: list[dict] = []
+    
+    # 方法1: 使用搜索 API 搜索稳定币交易对
+    # 搜索格式: "USDT/USDC", "USDT/DAI" 等
+    search_queries = [
+        f"{stable_symbol}/USDT",
+        f"{stable_symbol}/USDC",
+        f"{stable_symbol}/DAI",
+        f"{stable_symbol}/BUSD",
+        f"{stable_symbol}/USDD",
+        f"{stable_symbol}/TUSD",
+        f"{stable_symbol}/USDP",
+        f"USDT/{stable_symbol}",
+        f"USDC/{stable_symbol}",
+        f"DAI/{stable_symbol}",
+    ]
+    
+    # 去重，避免重复搜索
+    search_queries = list(set(search_queries))
+    
+    for query in search_queries:
+        try:
+            url = "https://api.dexscreener.com/latest/dex/search"
+            resp = requests.get(url, params={"q": query}, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            
+            pairs = data.get("pairs", [])
+            for pair in pairs:
+                chain_id = pair.get("chainId", "").lower()
+                if chain_id not in chains:
+                    continue
+                
+                base_token = pair.get("baseToken", {})
+                quote_token = pair.get("quoteToken", {})
+                base_symbol = (base_token.get("symbol") or "").upper()
+                quote_symbol = (quote_token.get("symbol") or "").upper()
+                
+                # 只保留稳定币-稳定币交易对
+                if base_symbol not in STABLE_SYMBOLS or quote_symbol not in STABLE_SYMBOLS:
+                    continue
+                
+                # 确保至少一侧是我们搜索的稳定币
+                if stable_symbol.upper() not in [base_symbol, quote_symbol]:
+                    continue
+                
+                liquidity = pair.get("liquidity", {})
+                liquidity_usd = float(liquidity.get("usd", 0) or 0)
+                
+                if liquidity_usd < min_liquidity_usd:
+                    continue
+                
+                pair_address = pair.get("pairAddress", "")
+                if not pair_address:
+                    continue
+                
+                # 检查是否已存在（避免重复）
+                existing = any(
+                    r.get("chain") == chain_id and r.get("pair_address") == pair_address
+                    for r in results
+                )
+                if existing:
+                    continue
+                
+                price_usd = pair.get("priceUsd")
+                try:
+                    price_usd = float(price_usd) if price_usd else None
+                except Exception:
+                    price_usd = None
+                
+                results.append({
+                    "chain": chain_id,
+                    "pair_address": pair_address,
+                    "base_token": {
+                        "symbol": base_symbol,
+                        "address": base_token.get("address", ""),
+                    },
+                    "quote_token": {
+                        "symbol": quote_symbol,
+                        "address": quote_token.get("address", ""),
+                    },
+                    "liquidity_usd": liquidity_usd,
+                    "price_usd": price_usd,
+                })
+        except Exception as e:
+            print(f"[自动采集] 搜索 {query} 失败: {e}")
+            continue
+    
+    # 方法2: 如果知道稳定币的 token 地址，可以使用 /tokens/v1 API
+    # 这里暂时不实现，因为需要预先知道 token 地址
+    
+    # 按流动性排序，并限制每条链的结果数
+    results.sort(key=lambda x: x["liquidity_usd"], reverse=True)
+    
+    # 按链分组，每条链最多保留 max_results_per_chain 个
+    by_chain: dict[str, list[dict]] = {}
+    for r in results:
+        chain = r["chain"]
+        if chain not in by_chain:
+            by_chain[chain] = []
+        if len(by_chain[chain]) < max_results_per_chain:
+            by_chain[chain].append(r)
+    
+    # 重新组合
+    final_results = []
+    for chain_results in by_chain.values():
+        final_results.extend(chain_results)
+    
+    return final_results
+
+
+def auto_collect_stablecoin_pairs(
+    stable_symbols: list[str] | None = None,
+    chains: list[str] | None = None,
+    min_liquidity_usd: float = 10000.0,
+    max_results_per_symbol: int = 10,
+) -> list[dict]:
+    """
+    自动采集多个稳定币的交易对。
+    
+    参数:
+        stable_symbols: 要采集的稳定币符号列表，如果为 None 则使用默认的主流稳定币
+        chains: 要搜索的链列表，如果为 None 则搜索所有支持的链
+        min_liquidity_usd: 最小流动性要求（USD）
+        max_results_per_symbol: 每个稳定币最多返回的结果数
+    
+    返回:
+        所有找到的交易对列表
+    """
+    if stable_symbols is None:
+        stable_symbols = list(STABLE_SYMBOLS)
+    
+    all_results: list[dict] = []
+    
+    for symbol in stable_symbols:
+        print(f"[自动采集] 正在搜索 {symbol} 的交易对...")
+        pairs = search_stablecoin_pairs(
+            stable_symbol=symbol,
+            chains=chains,
+            min_liquidity_usd=min_liquidity_usd,
+            max_results_per_chain=max_results_per_symbol,
+        )
+        all_results.extend(pairs)
+        print(f"[自动采集] {symbol} 找到 {len(pairs)} 个交易对")
+    
+    # 去重（基于 chain + pair_address）
+    seen = set()
+    unique_results = []
+    for r in all_results:
+        key = (r["chain"], r["pair_address"])
+        if key not in seen:
+            seen.add(key)
+            unique_results.append(r)
+    
+    return unique_results
 
 
 # ========== 数据获取与逻辑层 ==========
@@ -1661,7 +2003,7 @@ def run_cli_monitor_with_alerts():
                             f"跨链桥费 ${cd['跨链桥费']:.2f} / 滑点损失 ${cd['滑点损失']:.2f}"
                         )
                         send_all_notifications(msg)
-                        total_arbs += 1
+                        total_arb_opps += 1
                         last_arb_alerts[key] = now_ts
             else:
                 print("\n当前未发现达到阈值的跨链套利机会。")
@@ -1699,6 +2041,52 @@ def run_cli_monitor_with_alerts():
 
 def run_streamlit_panel():
     st.set_page_config(page_title="多链稳定币脱锚监控", layout="wide")
+    
+    # ----- 登录检查 -----
+    if not check_login():
+        st.stop()  # 未登录则停止执行
+    
+    # 显示登录信息和退出按钮
+    with st.sidebar:
+        st.markdown("---")
+        if st.session_state.get("name"):
+            st.info(f"👤 已登录: {st.session_state['name']}")
+            
+            # 修改密码功能
+            with st.expander("🔐 修改密码"):
+                new_password = st.text_input("新密码", type="password", key="new_password_input")
+                confirm_password = st.text_input("确认新密码", type="password", key="confirm_password_input")
+                if st.button("保存新密码", key="save_password_btn"):
+                    if not new_password:
+                        st.warning("密码不能为空")
+                    elif new_password != confirm_password:
+                        st.error("两次输入的密码不一致")
+                    else:
+                        try:
+                            config = load_auth_config()
+                            username = st.session_state.get("username", "admin")
+                            if username in config["credentials"]["usernames"]:
+                                # 生成新密码哈希
+                                new_password_hash = stauth.Hasher([new_password]).generate()[0]
+                                config["credentials"]["usernames"][username]["password"] = new_password_hash
+                                save_auth_config(config)
+                                st.success("密码已修改，请重新登录")
+                                # 清除登录状态
+                                for key in ["authentication_status", "name", "username", "authenticator", "auth_config"]:
+                                    if key in st.session_state:
+                                        del st.session_state[key]
+                                st.rerun()
+                            else:
+                                st.error("用户不存在")
+                        except Exception as e:
+                            st.error(f"修改密码失败: {e}")
+            
+            if st.button("🚪 退出登录"):
+                # 清除登录状态
+                for key in ["authentication_status", "name", "username", "authenticator", "auth_config"]:
+                    if key in st.session_state:
+                        del st.session_state[key]
+                st.rerun()
 
     st.title("多链稳定币脱锚监控面板")
 
@@ -1743,6 +2131,15 @@ def run_streamlit_panel():
         gcfg = load_global_config()
         st.session_state["lifi_api_key"] = gcfg.get("lifi_api_key", "")
         st.session_state["lifi_from_address"] = gcfg.get("lifi_from_address", "")
+    
+    # UI 配置持久化（价格曲线选择、脱锚阈值等）
+    if "ui_config" not in st.session_state:
+        gcfg = load_global_config()
+        ui_config = gcfg.get("ui_config", {})
+        st.session_state["ui_config"] = ui_config
+        st.session_state["selected_symbols"] = ui_config.get("selected_symbols", [])
+        st.session_state["saved_global_threshold"] = ui_config.get("global_threshold", DEFAULT_THRESHOLD)
+        st.session_state["global_threshold"] = st.session_state["saved_global_threshold"]
 
     # ----- 侧边栏：全局配置 & 稳定币配置 -----
     with st.sidebar:
@@ -1779,18 +2176,34 @@ def run_streamlit_panel():
             "默认脱锚阈值（%）",
             min_value=0.1,
             max_value=50.0,
-            value=float(st.session_state.get("global_threshold", DEFAULT_THRESHOLD)),
+            value=float(st.session_state.get("saved_global_threshold", DEFAULT_THRESHOLD)),
             step=0.1,
+            key="global_threshold_input",
         )
         st.session_state["global_threshold"] = default_threshold
+        
+        # 当阈值改变时自动保存
+        if st.session_state.get("saved_global_threshold") != default_threshold:
+            st.session_state["saved_global_threshold"] = default_threshold
+            # 自动保存到配置文件
+            gcfg = load_global_config()
+            if "ui_config" not in gcfg:
+                gcfg["ui_config"] = {}
+            gcfg["ui_config"]["global_threshold"] = default_threshold
+            save_global_config(gcfg)
 
-        # 保存全局配置按钮（包括 LI.FI API Key / fromAddress）
+        # 保存全局配置按钮（包括 LI.FI API Key / fromAddress / UI 配置）
         if st.button("保存全局配置（包括 LI.FI API Key 和 fromAddress）"):
             gcfg = {
                 "lifi_api_key": st.session_state.get("lifi_api_key", ""),
                 "lifi_from_address": st.session_state.get("lifi_from_address", ""),
+                "ui_config": {
+                    "global_threshold": st.session_state.get("global_threshold", DEFAULT_THRESHOLD),
+                    "selected_symbols": st.session_state.get("selected_symbols", []),
+                }
             }
             save_global_config(gcfg)
+            st.session_state["saved_global_threshold"] = gcfg["ui_config"]["global_threshold"]
             st.success(f"全局配置已保存到 {GLOBAL_CONFIG_FILE}。")
 
         st.markdown("---")
@@ -1989,6 +2402,226 @@ def run_streamlit_panel():
 
         st.markdown("---")
         st.subheader("监控的稳定币配置")
+        
+        # ========== 自动采集稳定币对功能 ==========
+        st.markdown("#### 🤖 自动采集稳定币对")
+        st.caption("使用 DexScreener API 自动搜索并添加稳定币交易对")
+        
+        # 初始化 session state
+        if "collected_pairs_cache" not in st.session_state:
+            st.session_state["collected_pairs_cache"] = []
+        if "available_chains" not in st.session_state:
+            st.session_state["available_chains"] = []
+        
+        # 从 API 获取支持的链列表
+        if st.button("🔄 刷新链列表", help="从 DexScreener API 获取最新支持的链列表"):
+            with st.spinner("正在从 API 获取支持的链列表..."):
+                try:
+                    chains = get_available_chains_from_api()
+                    st.session_state["available_chains"] = chains
+                    st.success(f"已获取 {len(chains)} 条链")
+                except Exception as e:
+                    st.error(f"获取链列表失败: {e}")
+                    # 失败时使用默认链列表
+                    st.session_state["available_chains"] = list(CHAIN_NAME_TO_ID.keys())
+        else:
+            # 如果没有缓存，使用默认链列表
+            if not st.session_state["available_chains"]:
+                st.session_state["available_chains"] = list(CHAIN_NAME_TO_ID.keys())
+        
+        col_auto1, col_auto2, col_auto3 = st.columns(3)
+        auto_symbols = col_auto1.multiselect(
+            "选择要采集的稳定币",
+            options=list(STABLE_SYMBOLS),
+            default=["USDT", "USDC"],
+            help="选择要自动搜索的稳定币符号",
+        )
+        auto_chains = col_auto2.multiselect(
+            "选择要搜索的链",
+            options=st.session_state["available_chains"],
+            default=["ethereum", "bsc", "arbitrum", "base", "polygon"] if any(c in st.session_state["available_chains"] for c in ["ethereum", "bsc", "arbitrum", "base", "polygon"]) else [],
+            help="选择要在哪些链上搜索（链列表从 API 动态获取）",
+        )
+        auto_min_liq = col_auto3.number_input(
+            "最小流动性（USD）",
+            min_value=0.0,
+            max_value=1_000_000.0,
+            value=10000.0,
+            step=1000.0,
+            help="只添加流动性大于此值的交易对",
+        )
+        
+        if st.button("🚀 开始自动采集", type="primary", use_container_width=True):
+            if not auto_symbols:
+                st.warning("请至少选择一个稳定币符号")
+            elif not auto_chains:
+                st.warning("请至少选择一条链")
+            else:
+                with st.spinner(f"正在自动采集 {', '.join(auto_symbols)} 在 {', '.join(auto_chains)} 上的交易对..."):
+                    try:
+                        collected_pairs = auto_collect_stablecoin_pairs(
+                            stable_symbols=auto_symbols,
+                            chains=auto_chains,
+                            min_liquidity_usd=float(auto_min_liq),
+                            max_results_per_symbol=10,
+                        )
+                        
+                        # 保存到 session state
+                        st.session_state["collected_pairs_cache"] = collected_pairs
+                        
+                        if not collected_pairs:
+                            st.warning("未找到符合条件的交易对，请尝试降低流动性要求或选择其他链")
+                        else:
+                            st.success(f"找到 {len(collected_pairs)} 个符合条件的交易对")
+                    except Exception as e:
+                        st.error(f"自动采集失败: {e}")
+                        import traceback
+                        st.code(traceback.format_exc())
+        
+        # 显示采集结果，支持多选勾选
+        if st.session_state["collected_pairs_cache"]:
+            collected_pairs = st.session_state["collected_pairs_cache"]
+            
+            st.markdown("---")
+            st.markdown("### 📋 采集结果（请勾选要添加的交易对）")
+            
+            # 初始化选中状态
+            if "selected_pair_indices" not in st.session_state:
+                st.session_state["selected_pair_indices"] = set()
+            
+            # 全选/全不选按钮
+            col_select_all, col_select_none, col_select_info = st.columns([1, 1, 2])
+            with col_select_all:
+                if st.button("✅ 全选", use_container_width=True):
+                    st.session_state["selected_pair_indices"] = set(range(len(collected_pairs)))
+                    st.rerun()
+            with col_select_none:
+                if st.button("❌ 全不选", use_container_width=True):
+                    st.session_state["selected_pair_indices"] = set()
+                    st.rerun()
+            with col_select_info:
+                selected_count = len(st.session_state["selected_pair_indices"])
+                st.markdown(f"**已选择: {selected_count} / {len(collected_pairs)} 个交易对**")
+            
+            # 使用复选框列表显示每个交易对
+            st.markdown("#### 交易对列表：")
+            
+            # 创建表格显示，每行一个复选框
+            for idx, p in enumerate(collected_pairs):
+                base_sym = p["base_token"]["symbol"]
+                quote_sym = p["quote_token"]["symbol"]
+                pair_name = f"{base_sym}/{quote_sym}"
+                
+                # 检查是否已存在于配置中
+                exists = any(
+                    cfg.get("chain") == p["chain"] 
+                    and cfg.get("pair_address") == p["pair_address"]
+                    for cfg in st.session_state["stable_configs"]
+                )
+                exists_marker = " ⚠️已存在" if exists else ""
+                
+                # 使用列布局：复选框 + 信息
+                col_cb, col_info1, col_info2, col_info3, col_info4 = st.columns([0.5, 2, 1.5, 1.5, 2])
+                
+                with col_cb:
+                    is_checked = idx in st.session_state["selected_pair_indices"]
+                    if st.checkbox(
+                        "",
+                        value=is_checked,
+                        key=f"pair_checkbox_{idx}",
+                        disabled=exists,  # 已存在的禁用勾选
+                    ):
+                        st.session_state["selected_pair_indices"].add(idx)
+                    else:
+                        st.session_state["selected_pair_indices"].discard(idx)
+                
+                with col_info1:
+                    st.markdown(f"**{pair_name}**{exists_marker}")
+                
+                with col_info2:
+                    st.markdown(f"链: `{p['chain']}`")
+                
+                with col_info3:
+                    st.markdown(f"流动性: `${p['liquidity_usd']:,.0f}`")
+                
+                with col_info4:
+                    price_str = f"{p['price_usd']:.6f}" if p.get('price_usd') else "N/A"
+                    st.markdown(f"价格: `{price_str}`")
+                    st.caption(f"地址: `{p['pair_address'][:10]}...`")
+            
+            # 显示选中交易对的汇总
+            selected_indices = st.session_state["selected_pair_indices"]
+            if selected_indices:
+                st.markdown("---")
+                st.markdown(f"### ✅ 已选择 {len(selected_indices)} 个交易对")
+                
+                # 显示选中交易对的详细信息表格
+                selected_display = []
+                for idx in selected_indices:
+                    p = collected_pairs[idx]
+                    base_sym = p["base_token"]["symbol"]
+                    quote_sym = p["quote_token"]["symbol"]
+                    selected_display.append({
+                        "交易对": f"{base_sym}/{quote_sym}",
+                        "链": p["chain"],
+                        "流动性(USD)": f"${p['liquidity_usd']:,.0f}",
+                        "价格(USD)": f"{p['price_usd']:.6f}" if p.get('price_usd') else "N/A",
+                        "Pair地址": p["pair_address"],
+                    })
+                
+                if selected_display:
+                    st.dataframe(pd.DataFrame(selected_display), use_container_width=True)
+                
+                # 添加到配置按钮
+                col_btn1, col_btn2 = st.columns([1, 1])
+                with col_btn1:
+                    if st.button("✅ 添加选中的交易对到监控配置", type="primary", use_container_width=True):
+                        added_count = 0
+                        skipped_count = 0
+                        
+                        for idx in selected_indices:
+                            p = collected_pairs[idx]
+                            base_sym = p["base_token"]["symbol"]
+                            quote_sym = p["quote_token"]["symbol"]
+                            pair_name = f"{base_sym}/{quote_sym}"
+                            
+                            # 检查是否已存在
+                            exists = any(
+                                cfg.get("chain") == p["chain"] 
+                                and cfg.get("pair_address") == p["pair_address"]
+                                for cfg in st.session_state["stable_configs"]
+                            )
+                            
+                            if exists:
+                                skipped_count += 1
+                                continue
+                            
+                            new_cfg = {
+                                "name": pair_name,
+                                "chain": p["chain"],
+                                "pair_address": p["pair_address"],
+                                "anchor_price": default_anchor,
+                                "threshold": default_threshold,
+                            }
+                            st.session_state["stable_configs"].append(new_cfg)
+                            added_count += 1
+                        
+                        save_stable_configs(st.session_state["stable_configs"])
+                        st.success(
+                            f"已添加 {added_count} 个交易对到监控配置"
+                            + (f"，跳过 {skipped_count} 个已存在的配置" if skipped_count > 0 else "")
+                        )
+                        # 清空缓存和选中状态
+                        st.session_state["collected_pairs_cache"] = []
+                        st.session_state["selected_pair_indices"] = set()
+                        st.rerun()
+                
+                with col_btn2:
+                    if st.button("🗑️ 清空选择", use_container_width=True):
+                        st.session_state["selected_pair_indices"] = set()
+                        st.rerun()
+        
+        st.markdown("---")
 
         existing_names = [c["name"] for c in st.session_state["stable_configs"]]
         selected_name = st.selectbox(
@@ -2234,11 +2867,30 @@ def run_streamlit_panel():
     symbols_available = sorted(
         { (s.get("symbol") or "").upper() for s in statuses if s.get("symbol") }
     )
+    
+    # 从持久化配置中加载已选择的符号
+    saved_selected = st.session_state.get("selected_symbols", [])
+    # 过滤掉不存在的符号（可能已删除）
+    valid_saved = [s for s in saved_selected if s in symbols_available]
+    # 如果没有保存的选择，使用默认值
+    default_selected = valid_saved if valid_saved else (symbols_available[:2] if symbols_available else [])
+    
     selected_symbols = st.multiselect(
         "选择要查看曲线的稳定币（按币种，多链聚合，可多选）",
         options=symbols_available,
-        default=symbols_available[:2] if symbols_available else [],
+        default=default_selected,
+        key="symbols_multiselect",
     )
+    
+    # 当选择改变时自动保存
+    if selected_symbols != st.session_state.get("selected_symbols", []):
+        st.session_state["selected_symbols"] = selected_symbols
+        # 自动保存到配置文件
+        gcfg = load_global_config()
+        if "ui_config" not in gcfg:
+            gcfg["ui_config"] = {}
+        gcfg["ui_config"]["selected_symbols"] = selected_symbols
+        save_global_config(gcfg)
 
     if not history_df.empty and selected_symbols:
         for sym in selected_symbols:
