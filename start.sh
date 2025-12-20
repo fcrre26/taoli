@@ -60,11 +60,13 @@ get_pid() {
 }
 
 find_streamlit_pid() {
+    # 匹配 streamlit run taoli.py（支持直接 streamlit 和 python -m streamlit 两种方式）
     pgrep -f "streamlit run taoli.py" | head -n 1 || echo ""
 }
 
 find_cli_pid() {
-    pgrep -f "python.*taoli.py cli" | head -n 1 || echo ""
+    # 匹配 python* taoli.py cli（支持 python、python3 等）
+    pgrep -f "python.*taoli.py.*cli" | head -n 1 || echo ""
 }
 
 stop_process() {
@@ -131,7 +133,8 @@ start_service() {
     
     # 启动 Streamlit 服务（后台运行）
     echo -e "${GREEN}启动 Streamlit 服务...${NC}"
-    nohup streamlit run taoli.py --server.port 8501 --server.address 0.0.0.0 --server.headless true > "$STREAMLIT_LOG" 2>&1 &
+    # 使用 python -m streamlit 更可靠，确保使用正确的 Python 环境
+    nohup $PYTHON_CMD -m streamlit run taoli.py --server.port 8501 --server.address 0.0.0.0 --server.headless true > "$STREAMLIT_LOG" 2>&1 &
     STREAMLIT_PID=$!
     
     # 等待一下，检查是否成功启动
@@ -295,7 +298,8 @@ start_cli() {
     
     # 启动 CLI 监控（后台运行）
     echo -e "${GREEN}启动 CLI 监控...${NC}"
-    nohup $PYTHON_CMD taoli.py cli > "$CLI_LOG" 2>&1 &
+    # 使用 -u 参数（unbuffered）以获得实时日志输出
+    nohup $PYTHON_CMD -u taoli.py cli > "$CLI_LOG" 2>&1 &
     CLI_PID=$!
     
     # 等待一下，检查是否成功启动
