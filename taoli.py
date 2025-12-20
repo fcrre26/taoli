@@ -3348,8 +3348,9 @@ def run_streamlit_panel():
             step=1,
         )
         auto_refresh = st.checkbox(
-            "页面自动刷新（按以上间隔）",
+            "自动刷新数据（按以上间隔，数据动态更新，页面不刷新）",
             value=st.session_state.get("auto_refresh", False),
+            help="开启后，API数据、价格、百分比等会自动更新跳动，但页面本身不会完全刷新"
         )
         st.session_state["auto_refresh"] = auto_refresh
         default_anchor = st.number_input(
@@ -5301,6 +5302,22 @@ def run_streamlit_panel():
     
     # 刷新按钮
     if st.button("🔄 刷新日志", width='stretch'):
+        st.rerun()
+    
+    # ----- 自动刷新逻辑（智能更新，不刷新整个页面）-----
+    # 如果开启自动刷新，使用 time.sleep() + st.rerun() 实现
+    # Streamlit 会智能地只更新变化的部分（价格、百分比等），而不是整个页面刷新
+    if st.session_state.get("auto_refresh", False):
+        interval = max(5, int(st.session_state.get("check_interval", DEFAULT_CHECK_INTERVAL)))
+        
+        # 显示刷新状态提示
+        st.info(
+            f"🔄 自动刷新已开启（间隔: {interval}秒）。"
+            f"数据将自动更新（价格、百分比等会动态跳动），页面不会完全刷新..."
+        )
+        
+        # 等待指定间隔后重新运行（Streamlit 会智能更新变化的部分）
+        time.sleep(interval)
         st.rerun()
 
 
