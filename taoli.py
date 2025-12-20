@@ -1353,10 +1353,12 @@ def search_stablecoin_pairs(
             
             pairs = data.get("pairs", [])
             for pair in pairs:
-                chain_id = pair.get("chainId", "").lower()
+                # 保持原始值，只在匹配时转小写
+                chain_id_raw = pair.get("chainId", "")
+                chain_id_normalized = chain_id_raw.lower() if chain_id_raw else ""
                 # 如果链ID不在选择的链列表中，跳过（但记录日志以便调试）
-                if chain_id not in chains:
-                    logger.debug(f"[搜索 {stable_symbol}] 跳过链 {chain_id}（不在选择的链列表中）")
+                if chain_id_normalized not in chains:
+                    logger.debug(f"[搜索 {stable_symbol}] 跳过链 {chain_id_normalized}（不在选择的链列表中）")
                     continue
                 
                 base_token = pair.get("baseToken", {})
@@ -1382,9 +1384,10 @@ def search_stablecoin_pairs(
                 if not pair_address:
                     continue
                 
-                # 检查是否已存在（避免重复）
+                # 检查是否已存在（避免重复）- 使用规范化值进行比较
                 existing = any(
-                    r.get("chain") == chain_id and r.get("pair_address") == pair_address
+                    str(r.get("chain", "")).lower().strip() == chain_id_normalized 
+                    and str(r.get("pair_address", "")).strip() == str(pair_address).strip()
                     for r in results
                 )
                 if existing:
@@ -1396,10 +1399,10 @@ def search_stablecoin_pairs(
                 except Exception:
                     price_usd = None
                 
-                # 构建交易对数据
+                # 构建交易对数据（保持原始格式，不格式化）
                 pair_data = {
-                    "chain": chain_id,
-                    "pair_address": pair_address,
+                    "chain": chain_id_raw,  # 保存原始值
+                    "pair_address": pair_address,  # 保存原始值
                     "base_token": {
                         "symbol": base_symbol,
                         "address": base_token.get("address", ""),
@@ -3872,9 +3875,12 @@ def run_streamlit_panel():
                     # 只选择未存在且非危险的交易对
                     safe_indices = []
                     for idx, p in enumerate(collected_pairs):
+                        # 规范化比较：统一转换为小写并去除空格
+                        pair_chain_normalized = str(p.get("chain", "")).lower().strip()
+                        pair_address_normalized = str(p.get("pair_address", "")).lower().strip()
                         exists = any(
-                            cfg.get("chain") == p["chain"] 
-                            and cfg.get("pair_address") == p["pair_address"]
+                            str(cfg.get("chain", "")).lower().strip() == pair_chain_normalized
+                            and str(cfg.get("pair_address", "")).lower().strip() == pair_address_normalized
                             for cfg in st.session_state["stable_configs"]
                         )
                         risk_level = p.get("legitimacy", {}).get("risk_level", "safe")
@@ -3901,9 +3907,12 @@ def run_streamlit_panel():
             # 根据筛选条件过滤交易对
             filtered_pairs = []
             for idx, p in enumerate(collected_pairs):
+                # 规范化比较：统一转换为小写并去除空格
+                pair_chain_normalized = str(p.get("chain", "")).lower().strip()
+                pair_address_normalized = str(p.get("pair_address", "")).lower().strip()
                 exists = any(
-                    cfg.get("chain") == p["chain"] 
-                    and cfg.get("pair_address") == p["pair_address"]
+                    str(cfg.get("chain", "")).lower().strip() == pair_chain_normalized
+                    and str(cfg.get("pair_address", "")).lower().strip() == pair_address_normalized
                     for cfg in st.session_state["stable_configs"]
                 )
                 risk_level = p.get("legitimacy", {}).get("risk_level", "safe")
@@ -4029,6 +4038,11 @@ def run_streamlit_panel():
                             )
             
             # 显示选中交易对的汇总（优化：更清晰的操作流程）
+            # 如果添加完成，清空选中状态（避免循环刷新）
+            if st.session_state.get("add_completed", False):
+                st.session_state["selected_pair_indices"] = []
+                st.session_state["add_completed"] = False
+            
             selected_indices = st.session_state["selected_pair_indices"]
             if selected_indices:
                 st.markdown("---")
@@ -4042,9 +4056,12 @@ def run_streamlit_panel():
                 skipped_preview = 0
                 for idx in selected_indices:
                     p = collected_pairs[idx]
+                    # 规范化比较：统一转换为小写并去除空格
+                    pair_chain_normalized = str(p.get("chain", "")).lower().strip()
+                    pair_address_normalized = str(p.get("pair_address", "")).lower().strip()
                     exists = any(
-                        cfg.get("chain") == p["chain"] 
-                        and cfg.get("pair_address") == p["pair_address"]
+                        str(cfg.get("chain", "")).lower().strip() == pair_chain_normalized
+                        and str(cfg.get("pair_address", "")).lower().strip() == pair_address_normalized
                         for cfg in st.session_state["stable_configs"]
                     )
                     if exists:
@@ -4067,9 +4084,12 @@ def run_streamlit_panel():
                         quote_sym = p["quote_token"]["symbol"]
                         pair_name = f"{base_sym}/{quote_sym}"
                         
+                        # 规范化比较：统一转换为小写并去除空格
+                        pair_chain_normalized = str(p.get("chain", "")).lower().strip()
+                        pair_address_normalized = str(p.get("pair_address", "")).lower().strip()
                         exists = any(
-                            cfg.get("chain") == p["chain"] 
-                            and cfg.get("pair_address") == p["pair_address"]
+                            str(cfg.get("chain", "")).lower().strip() == pair_chain_normalized
+                            and str(cfg.get("pair_address", "")).lower().strip() == pair_address_normalized
                             for cfg in st.session_state["stable_configs"]
                         )
                         
@@ -4088,22 +4108,42 @@ def run_streamlit_panel():
                 # 添加到配置按钮（优化：更明确的反馈）
                 col_btn1, col_btn2, col_btn3 = st.columns([2, 1, 1])
                 with col_btn1:
-                    if st.button("✅ 添加选中的交易对到监控配置", type="primary", width='stretch'):
+                    if st.button("✅ 添加选中的交易对到监控配置", type="primary", width='stretch', key="add_selected_pairs_btn"):
+                        # 立即显示处理中的提示
+                        status_placeholder = st.empty()
+                        status_placeholder.info("🔄 正在处理，请稍候...")
+                        
+                        # 立即保存 selected_indices 的值，避免在后续处理中被清空
+                        # 因为 selected_indices 是从 session_state 获取的，可能在处理过程中被修改
+                        saved_selected_indices = list(selected_indices) if selected_indices else []
+                        
+                        # 记录按钮点击事件
+                        logger.info("=" * 50)
+                        logger.info("用户点击了'添加选中的交易对到监控配置'按钮")
+                        logger.info(f"selected_indices: {saved_selected_indices}")
+                        logger.info(f"selected_indices长度: {len(saved_selected_indices)}")
+                        
                         try:
                             # 获取默认值（从侧边栏或 session state）
                             default_anchor_val = st.session_state.get("default_anchor", DEFAULT_ANCHOR_PRICE)
                             default_threshold_val = st.session_state.get("global_threshold", DEFAULT_THRESHOLD)
+                            logger.info(f"默认锚定价: {default_anchor_val}, 默认阈值: {default_threshold_val}")
                             
-                            # 验证必要数据
-                            if not selected_indices:
-                                st.warning("⚠️ 请先选择要添加的交易对")
+                            # 验证必要数据（使用保存的值）
+                            if not saved_selected_indices:
+                                status_placeholder.warning("⚠️ 请先选择要添加的交易对")
+                                logger.warning("用户点击添加按钮，但selected_indices为空")
+                                # 不立即刷新，让用户看到警告信息
                                 st.stop()
                             
                             if "collected_pairs_cache" not in st.session_state or not st.session_state["collected_pairs_cache"]:
-                                st.error("❌ 采集结果已丢失，请重新采集")
+                                status_placeholder.error("❌ 采集结果已丢失，请重新采集")
+                                logger.error("用户点击添加按钮，但collected_pairs_cache为空或不存在")
+                                # 不立即刷新，让用户看到错误信息
                                 st.stop()
                             
                             collected_pairs = st.session_state["collected_pairs_cache"]
+                            logger.info(f"采集结果数量: {len(collected_pairs)}")
                             
                             added_count = 0
                             skipped_count = 0
@@ -4113,7 +4153,8 @@ def run_streamlit_panel():
                             # 先收集所有要添加的配置（避免在循环中修改 session_state 导致问题）
                             configs_to_add = []
                             
-                            for idx in selected_indices:
+                            # 使用保存的 selected_indices，而不是从 session_state 获取
+                            for idx in saved_selected_indices:
                                 try:
                                     # 验证索引有效性
                                     if idx >= len(collected_pairs):
@@ -4145,9 +4186,13 @@ def run_streamlit_panel():
                                     pair_name = f"{base_sym}/{quote_sym}"
                                     
                                     # 检查是否已存在（使用当前的 session_state，因为我们在循环外收集配置）
+                                    # 规范化比较：统一转换为小写并去除空格，避免格式不一致导致误判
+                                    pair_chain_normalized = str(p.get("chain", "")).lower().strip()
+                                    pair_address_normalized = str(p.get("pair_address", "")).lower().strip()
+                                    
                                     exists = any(
-                                        cfg.get("chain") == p["chain"] 
-                                        and cfg.get("pair_address") == p["pair_address"]
+                                        str(cfg.get("chain", "")).lower().strip() == pair_chain_normalized
+                                        and str(cfg.get("pair_address", "")).lower().strip() == pair_address_normalized
                                         for cfg in st.session_state["stable_configs"]
                                     )
                                     
@@ -4164,10 +4209,19 @@ def run_streamlit_panel():
                                         logger.warning(f"索引 {idx} 的币对数据缺少 chain 字段: {p}")
                                         continue
                                     
+                                    # 规范化处理：去除首尾空格，统一转换为小写（与手工添加保持一致）
+                                    chain_from_pair = str(chain_from_pair).strip().lower()
+                                    pair_address_cleaned = str(p.get("pair_address", "")).strip()
+                                    
+                                    if not pair_address_cleaned:
+                                        error_details.append(f"索引 {idx}: pair_address 为空")
+                                        logger.warning(f"索引 {idx} 的币对数据 pair_address 为空")
+                                        continue
+                                    
                                     new_cfg = {
                                         "name": pair_name,
-                                        "chain": chain_from_pair,  # 使用采集数据中的链信息
-                                        "pair_address": p["pair_address"],
+                                        "chain": chain_from_pair,  # 使用采集数据中的链信息（已规范化）
+                                        "pair_address": pair_address_cleaned,  # 已清理空格
                                         "anchor_price": float(default_anchor_val),
                                         "threshold": float(default_threshold_val),
                                     }
@@ -4190,8 +4244,34 @@ def run_streamlit_panel():
                                     )
                                 
                                 config_count_before_add = len(st.session_state["stable_configs"])
-                                st.session_state["stable_configs"].extend(configs_to_add)
-                                added_count = len(configs_to_add)
+                                
+                                # 再次检查是否已存在（防止在收集过程中被其他操作修改）
+                                final_configs_to_add = []
+                                for cfg in configs_to_add:
+                                    cfg_chain_normalized = str(cfg.get("chain", "")).lower().strip()
+                                    cfg_address_normalized = str(cfg.get("pair_address", "")).lower().strip()
+                                    still_exists = any(
+                                        str(existing_cfg.get("chain", "")).lower().strip() == cfg_chain_normalized
+                                        and str(existing_cfg.get("pair_address", "")).lower().strip() == cfg_address_normalized
+                                        for existing_cfg in st.session_state["stable_configs"]
+                                    )
+                                    if not still_exists:
+                                        final_configs_to_add.append(cfg)
+                                    else:
+                                        logger.warning(
+                                            f"配置在添加前已存在，跳过: {cfg['name']} on {cfg['chain']}, "
+                                            f"pair_address={cfg['pair_address'][:20]}..."
+                                        )
+                                        skipped_count += 1
+                                        skipped_details.append(f"{cfg['name']} ({cfg['chain']})")
+                                
+                                if final_configs_to_add:
+                                    st.session_state["stable_configs"].extend(final_configs_to_add)
+                                    added_count = len(final_configs_to_add)
+                                else:
+                                    added_count = 0
+                                    logger.warning("所有配置在添加前都已存在，没有实际添加任何配置")
+                                
                                 config_count_after_add = len(st.session_state["stable_configs"])
                                 logger.info(
                                     f"添加完成: 添加了 {added_count} 个配置，"
@@ -4255,6 +4335,7 @@ def run_streamlit_panel():
                                 st.info("💡 提示：配置已保存，请查看主界面查看监控数据。页面将自动刷新...")
                             elif skipped_count > 0:
                                 st.warning(f"⚠️ 没有添加任何配置，所有 {skipped_count} 个都已存在！")
+                                st.info("💡 提示：如果这些交易对确实不存在，可能是格式不一致导致的误判。请检查配置文件或尝试重新采集。")
                                 logger.warning(f"没有添加任何配置，所有 {skipped_count} 个都已存在")
                             else:
                                 st.warning("⚠️ 没有添加任何配置，请检查是否选中了要添加的交易对")
@@ -4266,15 +4347,19 @@ def run_streamlit_panel():
                             
                             # 更新采集结果缓存（移除已添加的项，保留未添加的）
                             remaining_pairs = []
+                            # 使用保存的 selected_indices
                             for idx, p in enumerate(collected_pairs):
-                                if idx not in selected_indices:
+                                if idx not in saved_selected_indices:
                                     # 未选中的保留
                                     remaining_pairs.append(p)
                                 else:
                                     # 检查是否成功添加（可能因为已存在而跳过）
+                                    # 规范化比较：统一转换为小写并去除空格
+                                    pair_chain_normalized = str(p.get("chain", "")).lower().strip()
+                                    pair_address_normalized = str(p.get("pair_address", "")).lower().strip()
                                     exists = any(
-                                        cfg.get("chain") == p.get("chain") 
-                                        and cfg.get("pair_address") == p.get("pair_address")
+                                        str(cfg.get("chain", "")).lower().strip() == pair_chain_normalized
+                                        and str(cfg.get("pair_address", "")).lower().strip() == pair_address_normalized
                                         for cfg in st.session_state["stable_configs"]
                                     )
                                     if not exists:
@@ -4292,16 +4377,37 @@ def run_streamlit_panel():
                                     for err in error_details[:10]:  # 最多显示10个错误
                                         st.text(err)
                             
+                            # 记录完成日志
+                            logger.info("=" * 50)
+                            logger.info("添加配置流程完成")
+                            
+                            # 清除状态占位符
+                            status_placeholder.empty()
+                            
                             # 清空选中状态（但保留采集结果，方便继续操作）
-                            st.session_state["selected_pair_indices"] = []
+                            # 注意：不要立即清空，让用户看到成功消息后再清空
+                            # 使用一个标志来标记添加完成，避免立即刷新导致循环
+                            st.session_state["add_completed"] = True
+                            
+                            # 延迟刷新，确保用户能看到成功消息
+                            # 使用st.rerun()刷新页面，显示最新状态
+                            # 注意：rerun会重新执行整个脚本，成功/失败消息会显示在页面上
                             st.rerun()
                             
                         except Exception as e:
-                            st.error(f"❌ 添加配置时发生错误: {e}")
+                            # 显示错误信息
+                            status_placeholder.error(f"❌ 添加配置时发生错误: {e}")
                             logger.error(f"添加配置时发生错误: {e}", exc_info=True)
-                            with st.expander("查看错误详情"):
+                            
+                            # 显示详细错误信息
+                            with st.expander("🔍 查看错误详情", expanded=True):
                                 import traceback
                                 st.code(traceback.format_exc())
+                                st.write("**错误类型:**", type(e).__name__)
+                                st.write("**错误信息:**", str(e))
+                            
+                            # 不要立即刷新，让用户看到错误信息
+                            # st.rerun()
                 
                 with col_btn2:
                     if st.button("🗑️ 清空选择", width='stretch'):
@@ -4387,10 +4493,15 @@ def run_streamlit_panel():
                     "pair_address": parsed_pair,
                     "anchor_price": anchor_input,
                 }
-                # 如果 (name, chain) 已存在，更新；否则追加
+                # 如果 (chain, pair_address) 已存在，更新；否则追加
+                # 使用规范化比较，避免格式不一致导致误判
                 found = False
+                parsed_chain_normalized = str(parsed_chain).lower().strip()
+                parsed_pair_normalized = str(parsed_pair).strip()
                 for idx, cfg in enumerate(st.session_state["stable_configs"]):
-                    if cfg["name"] == name_input and cfg["chain"] == chain_input:
+                    cfg_chain_normalized = str(cfg.get("chain", "")).lower().strip()
+                    cfg_pair_normalized = str(cfg.get("pair_address", "")).strip()
+                    if cfg_chain_normalized == parsed_chain_normalized and cfg_pair_normalized == parsed_pair_normalized:
                         st.session_state["stable_configs"][idx] = updated
                         found = True
                         break
