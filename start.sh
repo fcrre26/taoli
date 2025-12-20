@@ -1315,37 +1315,47 @@ def search_stablecoin_pairs(
     if chains is None:
         chains = list(CHAIN_NAME_TO_ID.keys())
     
+    # 规范化链列表（统一转小写，确保匹配）
+    chains_normalized = [str(c).lower().strip() for c in chains] if chains else []
+    
     # 记录搜索参数（用于调试）
     logger.info(
         f"[搜索 {stable_symbol}] 开始搜索 | "
-        f"链列表: {sorted(chains)} ({len(chains)}条) | "
+        f"链列表: {sorted(chains_normalized)} ({len(chains_normalized)}条) | "
         f"最小流动性: ${min_liquidity_usd:,.0f}"
     )
     
     # 先收集所有候选交易对（不进行过滤）
     all_candidates: list[dict] = []
+    chains_found_in_api: set[str] = set()  # 记录 API 实际返回了哪些链
     
-    # 确定要搜索的稳定币列表
+    # 方法1: 使用搜索 API 搜索稳定币交易对
+    # 策略：搜索稳定币对组合（如 USDT/USDC, USDT/DAI），而不是单个稳定币名字
+    # 原因：如果只搜索 "USDT"，会返回所有包含 USDT 的交易对（包括 USDT/BTC, USDT/ETH 等），结果太多
+    
+    # 确定要搜索的稳定币列表（用于组合搜索）
     if all_stable_symbols is None:
-        # 默认使用主流稳定币（向后兼容）
-        target_symbols = ["USDT", "USDC", "DAI", "BUSD", "USDD", "TUSD", "USDP"]
+        # 使用所有已知的稳定币（从 STABLE_SYMBOLS 获取）
+        all_stable_list = get_all_stable_symbols()
+        target_symbols = [s.upper() for s in all_stable_list if s.upper() != stable_symbol.upper()]
     else:
         # 使用传入的所有稳定币列表，但排除自己（避免搜索 A/A）
         target_symbols = [s.upper() for s in all_stable_symbols if s.upper() != stable_symbol.upper()]
     
-    # 方法1: 使用搜索 API 搜索稳定币交易对
-    # 搜索格式: "USDT/USDC", "USDT/DAI" 等
-    # 搜索与所有目标稳定币的组合（双向搜索）
+    # 构建搜索查询：稳定币对组合（双向搜索）
     search_queries = []
     for target_symbol in target_symbols:
         # 双向搜索：A/B 和 B/A（DexScreener 可能返回不同结果）
-        search_queries.append(f"{stable_symbol}/{target_symbol}")
-        search_queries.append(f"{target_symbol}/{stable_symbol}")
+        search_queries.append(f"{stable_symbol.upper()}/{target_symbol}")
+        search_queries.append(f"{target_symbol}/{stable_symbol.upper()}")
     
     # 去重，避免重复搜索（例如 USDT/USDC 和 USDC/USDT 可能重复）
     search_queries = list(set(search_queries))
     
-    logger.debug(f"[搜索 {stable_symbol}] 将搜索 {len(search_queries)} 个查询（与 {len(target_symbols)} 个稳定币的组合）")
+    logger.info(
+        f"[搜索 {stable_symbol}] 使用稳定币对组合搜索 | "
+        f"搜索查询数: {len(search_queries)} 个（与 {len(target_symbols)} 个稳定币的组合）"
+    )
     
     for query_idx, query in enumerate(search_queries, 1):
         try:
@@ -1366,6 +1376,10 @@ def search_stablecoin_pairs(
                 # 保持原始值，只在匹配时转小写
                 chain_id_raw = pair.get("chainId", "")
                 chain_id_normalized = chain_id_raw.lower() if chain_id_raw else ""
+                
+                # 记录 API 返回的链
+                if chain_id_normalized:
+                    chains_found_in_api.add(chain_id_normalized)
                 
                 base_token = pair.get("baseToken", {})
                 quote_token = pair.get("quoteToken", {})
@@ -1405,6 +1419,189 @@ def search_stablecoin_pairs(
             logger.warning(f"[自动采集] 搜索 {query} 失败: {e}")
             continue
     
+    # 方法2: 使用 /token-pairs/v1 API 按链搜索（补充方法）
+    # 策略：
+    # 1. 先使用已知的官方地址（如果有）
+    # 2. 从全局搜索结果中提取 token 地址，用于未覆盖的链
+    # 3. 对每个选择的链，尝试按链搜索，确保不遗漏
+    
+    stable_symbol_upper = stable_symbol.upper()
+    
+    # 收集所有可用的 token 地址（已知地址 + 从搜索结果中提取的地址）
+    token_addresses_by_chain: dict[str, list[str]] = {}
+    
+    # 1. 添加已知的官方地址
+    if stable_symbol_upper in OFFICIAL_STABLE_ADDRESSES:
+        official_addrs = OFFICIAL_STABLE_ADDRESSES[stable_symbol_upper]
+        for chain, addr in official_addrs.items():
+            chain_norm = chain.lower().strip()
+            if chain_norm in chains_normalized:
+                if chain_norm not in token_addresses_by_chain:
+                    token_addresses_by_chain[chain_norm] = []
+                if addr and addr not in token_addresses_by_chain[chain_norm]:
+                    token_addresses_by_chain[chain_norm].append(addr)
+    
+    # 2. 从全局搜索结果中提取 token 地址（用于未覆盖的链）
+    # 注意：不限制地址格式，支持所有链的地址格式（EVM、Solana、Starknet等）
+    for candidate in all_candidates:
+        chain_norm = candidate.get("chain_normalized", "")
+        if not chain_norm or chain_norm not in chains_normalized:
+            continue
+        
+        base_token = candidate.get("base_token", {})
+        quote_token = candidate.get("quote_token", {})
+        base_symbol = base_token.get("symbol", "").upper()
+        quote_symbol = quote_token.get("symbol", "").upper()
+        
+        # 如果这个交易对包含目标稳定币，提取其地址（不管地址格式如何）
+        if base_symbol == stable_symbol_upper:
+            base_addr = base_token.get("address", "")
+            # 不验证地址格式，直接使用（支持所有链的地址格式）
+            if base_addr and base_addr.strip():
+                base_addr = base_addr.strip()
+                if chain_norm not in token_addresses_by_chain:
+                    token_addresses_by_chain[chain_norm] = []
+                if base_addr not in token_addresses_by_chain[chain_norm]:
+                    token_addresses_by_chain[chain_norm].append(base_addr)
+                    logger.debug(
+                        f"[搜索 {stable_symbol}] 从全局搜索结果提取地址: {chain_norm} | "
+                        f"{base_symbol} = {base_addr[:30]}..."
+                    )
+        
+        if quote_symbol == stable_symbol_upper:
+            quote_addr = quote_token.get("address", "")
+            # 不验证地址格式，直接使用（支持所有链的地址格式）
+            if quote_addr and quote_addr.strip():
+                quote_addr = quote_addr.strip()
+                if chain_norm not in token_addresses_by_chain:
+                    token_addresses_by_chain[chain_norm] = []
+                if quote_addr not in token_addresses_by_chain[chain_norm]:
+                    token_addresses_by_chain[chain_norm].append(quote_addr)
+                    logger.debug(
+                        f"[搜索 {stable_symbol}] 从全局搜索结果提取地址: {chain_norm} | "
+                        f"{quote_symbol} = {quote_addr[:30]}..."
+                    )
+    
+    # 3. 对每个选择的链，如果有 token 地址，则进行按链搜索
+    chains_to_search_by_chain = [c for c in chains_normalized if c in token_addresses_by_chain]
+    chains_without_address = [c for c in chains_normalized if c not in token_addresses_by_chain]
+    
+    if chains_to_search_by_chain:
+        logger.info(
+            f"[搜索 {stable_symbol}] 启用按链搜索补充方法 | "
+            f"有地址的链: {sorted(chains_to_search_by_chain)} ({len(chains_to_search_by_chain)}条) | "
+            f"无地址的链: {sorted(chains_without_address)} ({len(chains_without_address)}条)"
+        )
+        
+        for chain in chains_to_search_by_chain:
+            addresses = token_addresses_by_chain[chain]
+            logger.debug(f"[搜索 {stable_symbol}] 链 {chain} 有 {len(addresses)} 个 token 地址，开始按链搜索")
+            
+            # 对每个地址进行搜索（可能同一链上有多个版本的 token）
+            for token_address in addresses:
+                try:
+                    url = f"https://api.dexscreener.com/token-pairs/v1/{chain}/{token_address}"
+                    logger.debug(f"[搜索 {stable_symbol}] 按链搜索: {chain} | token: {token_address[:20]}...")
+                    
+                    resp = make_rate_limited_request(
+                        url,
+                        timeout=API_TIMEOUT,
+                        rate_limiter=_dexscreener_rate_limiter,
+                    )
+                    data = resp.json()
+                    
+                    # API 返回的是数组
+                    pairs = data if isinstance(data, list) else []
+                    logger.debug(f"[搜索 {stable_symbol}] 链 {chain} token {token_address[:20]}... 返回 {len(pairs)} 个交易对")
+                    
+                    for pair in pairs:
+                        chain_id_raw = pair.get("chainId", "")
+                        chain_id_normalized = chain_id_raw.lower() if chain_id_raw else ""
+                        
+                        # 只处理目标链的结果（API 可能返回其他链的结果）
+                        if chain_id_normalized != chain:
+                            continue
+                        
+                        # 记录 API 返回的链
+                        if chain_id_normalized:
+                            chains_found_in_api.add(chain_id_normalized)
+                        
+                        base_token = pair.get("baseToken", {})
+                        quote_token = pair.get("quoteToken", {})
+                        base_symbol = (base_token.get("symbol") or "").upper()
+                        quote_symbol = (quote_token.get("symbol") or "").upper()
+                        pair_address = pair.get("pairAddress", "")
+                        liquidity = pair.get("liquidity", {})
+                        liquidity_usd = float(liquidity.get("usd", 0) or 0)
+                        
+                        price_usd = pair.get("priceUsd")
+                        try:
+                            price_usd = float(price_usd) if price_usd else None
+                        except Exception:
+                            price_usd = None
+                        
+                        # 构建候选交易对数据
+                        candidate = {
+                            "chain": chain_id_raw,  # 保存原始值
+                            "chain_normalized": chain_id_normalized,
+                            "pair_address": pair_address,  # 保存原始值
+                            "base_token": {
+                                "symbol": base_symbol,
+                                "address": base_token.get("address", ""),
+                            },
+                            "quote_token": {
+                                "symbol": quote_symbol,
+                                "address": quote_token.get("address", ""),
+                            },
+                            "liquidity_usd": liquidity_usd,
+                            "price_usd": price_usd,
+                            "dexId": pair.get("dexId", ""),
+                            "raw_pair": pair,  # 保存原始数据
+                            "source": "token-pairs-api",  # 标记来源，用于调试
+                        }
+                        
+                        all_candidates.append(candidate)
+                        
+                except Exception as e:
+                    logger.warning(f"[搜索 {stable_symbol}] 按链搜索 {chain} token {token_address[:20]}... 失败: {e}")
+                    continue
+    
+    # 4. 对于没有地址的链，给出提示和建议
+    if chains_without_address:
+        logger.warning(
+            f"[搜索 {stable_symbol}] ⚠️ 以下链没有找到 token 地址，仅使用全局搜索: {sorted(chains_without_address)} | "
+            f"可能原因：1) 全局搜索未返回这些链的结果；2) 这些链上确实没有符合条件的交易对；"
+            f"3) 这些链的地址格式特殊，需要手动添加地址。"
+            f"建议：如果这些链上有该稳定币，可以手动添加到 OFFICIAL_STABLE_ADDRESSES 配置中。"
+        )
+        
+        # 统计这些链在全局搜索中是否出现过
+        chains_found_in_global = set()
+        for candidate in all_candidates:
+            if candidate.get("source") != "token-pairs-api":
+                chain_norm = candidate.get("chain_normalized", "")
+                if chain_norm:
+                    chains_found_in_global.add(chain_norm)
+        
+        truly_missing = [c for c in chains_without_address if c not in chains_found_in_global]
+        if truly_missing:
+            logger.warning(
+                f"[搜索 {stable_symbol}] ⚠️ 以下链在全局搜索中也未找到任何结果: {sorted(truly_missing)} | "
+                f"这些链可能需要：1) 手动添加 token 地址；2) 检查链名是否正确；3) 确认这些链上是否有该稳定币。"
+            )
+    
+    # 输出 API 返回的链信息（用于调试）
+    missing_chains = set(chains_normalized) - chains_found_in_api
+    if missing_chains:
+        logger.warning(
+            f"[搜索 {stable_symbol}] ⚠️ 以下链在 API 返回结果中未找到: {sorted(missing_chains)} | "
+            f"API 实际返回的链: {sorted(chains_found_in_api)}"
+        )
+    else:
+        logger.debug(
+            f"[搜索 {stable_symbol}] API 返回的链: {sorted(chains_found_in_api)}"
+        )
+    
     # 统计过滤原因
     stats = {
         "total_found": len(all_candidates),
@@ -1429,12 +1626,13 @@ def search_stablecoin_pairs(
         pair_address = candidate["pair_address"]
         liquidity_usd = candidate["liquidity_usd"]
         
-        # 1. 链过滤
-        if chain_id_normalized not in chains:
+        # 1. 链过滤（使用规范化后的链列表）
+        if chain_id_normalized not in chains_normalized:
             stats["filtered_chain"] += 1
             logger.debug(
                 f"[搜索 {stable_symbol}] 跳过链 {chain_id_normalized} "
-                f"（不在选择的链列表中）| 交易对: {base_symbol}/{quote_symbol} | 流动性: ${liquidity_usd:,.0f}"
+                f"（不在选择的链列表中: {sorted(chains_normalized)}）| "
+                f"交易对: {base_symbol}/{quote_symbol} | 流动性: ${liquidity_usd:,.0f}"
             )
             continue
         
@@ -1523,10 +1721,15 @@ def search_stablecoin_pairs(
         )
         results.append(pair_data)
     
+    # 统计搜索方法来源
+    search_method1_count = sum(1 for c in all_candidates if c.get("source") != "token-pairs-api")
+    search_method2_count = sum(1 for c in all_candidates if c.get("source") == "token-pairs-api")
+    
     # 输出详细统计信息
     logger.info(
         f"[搜索 {stable_symbol}] 搜索完成 | "
-        f"API返回: {stats['total_found']} 个交易对 | "
+        f"API返回: {stats['total_found']} 个交易对（涉及 {len(chains_found_in_api)} 条链）| "
+        f"搜索方法: 全局搜索({search_method1_count}) + 按链搜索({search_method2_count}) | "
         f"过滤统计: 链不匹配({stats['filtered_chain']}) | "
         f"非稳定币({stats['filtered_not_stable']}) | "
         f"不包含目标({stats['filtered_not_target']}) | "
@@ -1537,8 +1740,101 @@ def search_stablecoin_pairs(
         f"✅ 最终保留: {stats['passed']} 个"
     )
     
-    # 方法2: 如果知道稳定币的 token 地址，可以使用 /tokens/v1 API
-    # 这里暂时不实现，因为需要预先知道 token 地址
+    # 如果选择的链中有未在 API 返回结果中出现的，给出警告
+    if missing_chains:
+        if stable_symbol_upper in OFFICIAL_STABLE_ADDRESSES:
+            missing_with_address = [c for c in missing_chains if c in OFFICIAL_STABLE_ADDRESSES[stable_symbol_upper]]
+            if missing_with_address:
+                logger.warning(
+                    f"[搜索 {stable_symbol}] ⚠️ 以下链有已知地址但未找到交易对: {sorted(missing_with_address)}。"
+                    f"可能原因：1) 这些链上确实没有符合条件的交易对；2) API 请求失败。"
+                )
+        
+        if stats['total_found'] > 0:
+            logger.warning(
+                f"[搜索 {stable_symbol}] ⚠️ 注意: 选择的链 {sorted(missing_chains)} 在 API 返回结果中未出现。"
+                f"这可能是因为：1) 全局搜索未覆盖这些链；2) 这些链上确实没有符合条件的交易对；"
+                f"3) API 返回结果有分页限制。建议检查 DexScreener 网站确认这些链上是否有交易对。"
+            )
+    
+    # 方法2: 如果知道稳定币的 token 地址，使用 /token-pairs/v1 API 按链搜索
+    # 这样可以确保覆盖所有选择的链，不会遗漏
+    stable_symbol_upper = stable_symbol.upper()
+    if stable_symbol_upper in OFFICIAL_STABLE_ADDRESSES:
+        official_addrs = OFFICIAL_STABLE_ADDRESSES[stable_symbol_upper]
+        logger.info(
+            f"[搜索 {stable_symbol}] 检测到已知 token 地址，启用按链搜索补充方法 | "
+            f"覆盖链: {sorted([c for c in chains_normalized if c in official_addrs])}"
+        )
+        
+        # 对每个选择的链，如果知道 token 地址，则按链搜索
+        for chain in chains_normalized:
+            if chain not in official_addrs:
+                continue  # 该链没有已知的 token 地址，跳过
+            
+            token_address = official_addrs[chain]
+            try:
+                url = f"https://api.dexscreener.com/token-pairs/v1/{chain}/{token_address}"
+                logger.debug(f"[搜索 {stable_symbol}] 按链搜索: {chain} | token: {token_address[:20]}...")
+                
+                resp = make_rate_limited_request(
+                    url,
+                    timeout=API_TIMEOUT,
+                    rate_limiter=_dexscreener_rate_limiter,
+                )
+                data = resp.json()
+                
+                # API 返回的是数组
+                pairs = data if isinstance(data, list) else []
+                logger.debug(f"[搜索 {stable_symbol}] 链 {chain} 返回 {len(pairs)} 个交易对")
+                
+                for pair in pairs:
+                    chain_id_raw = pair.get("chainId", "")
+                    chain_id_normalized = chain_id_raw.lower() if chain_id_raw else ""
+                    
+                    # 记录 API 返回的链
+                    if chain_id_normalized:
+                        chains_found_in_api.add(chain_id_normalized)
+                    
+                    base_token = pair.get("baseToken", {})
+                    quote_token = pair.get("quoteToken", {})
+                    base_symbol = (base_token.get("symbol") or "").upper()
+                    quote_symbol = (quote_token.get("symbol") or "").upper()
+                    pair_address = pair.get("pairAddress", "")
+                    liquidity = pair.get("liquidity", {})
+                    liquidity_usd = float(liquidity.get("usd", 0) or 0)
+                    
+                    price_usd = pair.get("priceUsd")
+                    try:
+                        price_usd = float(price_usd) if price_usd else None
+                    except Exception:
+                        price_usd = None
+                    
+                    # 构建候选交易对数据
+                    candidate = {
+                        "chain": chain_id_raw,  # 保存原始值
+                        "chain_normalized": chain_id_normalized,
+                        "pair_address": pair_address,  # 保存原始值
+                        "base_token": {
+                            "symbol": base_symbol,
+                            "address": base_token.get("address", ""),
+                        },
+                        "quote_token": {
+                            "symbol": quote_symbol,
+                            "address": quote_token.get("address", ""),
+                        },
+                        "liquidity_usd": liquidity_usd,
+                        "price_usd": price_usd,
+                        "dexId": pair.get("dexId", ""),
+                        "raw_pair": pair,  # 保存原始数据
+                        "source": "token-pairs-api",  # 标记来源
+                    }
+                    
+                    all_candidates.append(candidate)
+                    
+            except Exception as e:
+                logger.warning(f"[搜索 {stable_symbol}] 按链搜索 {chain} 失败: {e}")
+                continue
     
     # 按流动性排序，并限制每条链的结果数
     results.sort(key=lambda x: x["liquidity_usd"], reverse=True)
