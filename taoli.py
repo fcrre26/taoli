@@ -1012,7 +1012,7 @@ def check_login() -> bool:
     with col2:
         password = st.text_input("密码", type="password", value="", key="login_password")
     
-    if st.button("登录", type="primary", use_container_width=True):
+    if st.button("登录", type="primary", width='stretch'):
         if not username or not password:
             st.error("请输入用户名和密码")
             return False
@@ -3359,6 +3359,9 @@ def run_streamlit_panel():
             value=float(DEFAULT_ANCHOR_PRICE),
             step=0.01,
         )
+        # 保存到 session state，供添加配置时使用
+        st.session_state["default_anchor"] = default_anchor
+        
         default_threshold = st.number_input(
             "默认脱锚阈值（%）",
             min_value=0.1,
@@ -3416,7 +3419,7 @@ def run_streamlit_panel():
         # 保存全局配置按钮（包括 LI.FI API Key / fromAddress / UI 配置）
         col_save, col_clear = st.columns(2)
         with col_save:
-            if st.button("💾 保存全局配置", use_container_width=True):
+            if st.button("💾 保存全局配置", width='stretch'):
                 gcfg = {
                     "lifi_api_key": st.session_state.get("lifi_api_key", ""),
                     "lifi_from_address": st.session_state.get("lifi_from_address", ""),
@@ -3430,7 +3433,7 @@ def run_streamlit_panel():
                 st.success(f"全局配置已保存到 {GLOBAL_CONFIG_FILE}。")
         
         with col_clear:
-            if st.button("🗑️ 清除缓存", use_container_width=True, help="清除 API 缓存，强制重新获取数据"):
+            if st.button("🗑️ 清除缓存", width='stretch', help="清除 API 缓存，强制重新获取数据"):
                 _global_cache.clear()
                 st.success("缓存已清除")
                 logger.info("用户手动清除了缓存")
@@ -3652,7 +3655,7 @@ def run_streamlit_panel():
         with st.expander("⚙️ 链列表管理", expanded=False):
             col_refresh, col_info = st.columns([1, 2])
             with col_refresh:
-                if st.button("🔄 刷新链列表", use_container_width=True, help="从 DexScreener API 获取最新支持的链列表"):
+                if st.button("🔄 刷新链列表", width='stretch', help="从 DexScreener API 获取最新支持的链列表"):
                     with st.spinner("正在从 API 获取支持的链列表..."):
                         try:
                             chains = get_available_chains_from_api()
@@ -3677,7 +3680,7 @@ def run_streamlit_panel():
             )
             col_add1, col_add2, col_add3 = st.columns([1, 1, 1])
             with col_add1:
-                if st.button("➕ 添加", key="add_custom_symbol", use_container_width=True):
+                if st.button("➕ 添加", key="add_custom_symbol", width='stretch'):
                     if new_symbol:
                         symbol_upper = new_symbol.upper().strip()
                         if symbol_upper:
@@ -3692,7 +3695,7 @@ def run_streamlit_panel():
                         else:
                             st.warning("⚠️ 请输入有效的稳定币符号")
             with col_add2:
-                if st.button("📋 查看列表", key="view_custom_symbols", use_container_width=True):
+                if st.button("📋 查看列表", key="view_custom_symbols", width='stretch'):
                     custom_symbols = load_custom_stable_symbols()
                     if custom_symbols:
                         st.info("已添加的自定义稳定币: " + ", ".join(custom_symbols))
@@ -3719,11 +3722,11 @@ def run_streamlit_panel():
         st.markdown("**📊 选择要采集的稳定币**")
         col_symbols_btn1, col_symbols_btn2, col_symbols_btn3 = st.columns([1, 1, 2])
         with col_symbols_btn1:
-            if st.button("✅ 全选稳定币", key="select_all_symbols", use_container_width=True):
+            if st.button("✅ 全选稳定币", key="select_all_symbols", width='stretch'):
                 st.session_state["auto_symbols_multiselect"] = list(all_stable_symbols)
                 st.rerun()
         with col_symbols_btn2:
-            if st.button("❌ 清空稳定币", key="clear_all_symbols", use_container_width=True):
+            if st.button("❌ 清空稳定币", key="clear_all_symbols", width='stretch'):
                 st.session_state["auto_symbols_multiselect"] = []
                 st.rerun()
         with col_symbols_btn3:
@@ -3742,11 +3745,11 @@ def run_streamlit_panel():
         st.markdown("**⛓️ 选择要搜索的链**")
         col_chains_btn1, col_chains_btn2, col_chains_btn3 = st.columns([1, 1, 2])
         with col_chains_btn1:
-            if st.button("✅ 全选链", key="select_all_chains", use_container_width=True):
+            if st.button("✅ 全选链", key="select_all_chains", width='stretch'):
                 st.session_state["auto_chains_multiselect"] = list(st.session_state["available_chains"])
                 st.rerun()
         with col_chains_btn2:
-            if st.button("❌ 清空链", key="clear_all_chains", use_container_width=True):
+            if st.button("❌ 清空链", key="clear_all_chains", width='stretch'):
                 st.session_state["auto_chains_multiselect"] = []
                 st.rerun()
         with col_chains_btn3:
@@ -3771,7 +3774,7 @@ def run_streamlit_panel():
             help="💡 只添加流动性大于此值的交易对（建议: 50万-100万 USD）",
         )
         
-        if st.button("🚀 开始自动采集", type="primary", use_container_width=True):
+        if st.button("🚀 开始自动采集", type="primary", width='stretch'):
             if not auto_symbols:
                 st.warning("请至少选择一个稳定币符号")
             elif not auto_chains:
@@ -3862,7 +3865,7 @@ def run_streamlit_panel():
             # 全选/全不选按钮（优化：减少不必要的 rerun）
             col_select_all, col_select_none, col_select_info, col_select_filter = st.columns([1, 1, 2, 1])
             with col_select_all:
-                if st.button("✅ 全选", key="select_all_pairs", use_container_width=True):
+                if st.button("✅ 全选", key="select_all_pairs", width='stretch'):
                     # 只选择未存在且非危险的交易对
                     safe_indices = []
                     for idx, p in enumerate(collected_pairs):
@@ -3877,7 +3880,7 @@ def run_streamlit_panel():
                     st.session_state["selected_pair_indices"] = safe_indices
                     st.rerun()
             with col_select_none:
-                if st.button("❌ 全不选", key="select_none_pairs", use_container_width=True):
+                if st.button("❌ 全不选", key="select_none_pairs", width='stretch'):
                     st.session_state["selected_pair_indices"] = []
                     st.rerun()
             with col_select_info:
@@ -3945,7 +3948,7 @@ def run_streamlit_panel():
                 df_display = pd.DataFrame(display_data)
                 st.dataframe(
                     df_display[["选择", "状态", "交易对", "链", "流动性(USD)", "价格(USD)"]],
-                    use_container_width=True,
+                    width='stretch',
                     height=min(400, len(filtered_pairs) * 35 + 50),  # 自适应高度
                     hide_index=True,
                 )
@@ -3955,7 +3958,7 @@ def run_streamlit_panel():
                 col_batch1, col_batch2, col_batch3 = st.columns(3)
                 
                 with col_batch1:
-                    if st.button("✅ 选择所有安全项", key="select_all_safe", use_container_width=True):
+                    if st.button("✅ 选择所有安全项", key="select_all_safe", width='stretch'):
                         safe_indices = [idx for idx, _, exists, risk in filtered_pairs 
                                        if not exists and risk == "safe"]
                         current = set(st.session_state["selected_pair_indices"])
@@ -3964,7 +3967,7 @@ def run_streamlit_panel():
                         st.rerun()
                 
                 with col_batch2:
-                    if st.button("✅ 选择高流动性项（>100万）", key="select_high_liq", use_container_width=True):
+                    if st.button("✅ 选择高流动性项（>100万）", key="select_high_liq", width='stretch'):
                         high_liq_indices = [idx for idx, p, exists, risk in filtered_pairs 
                                            if not exists and risk != "danger" and p['liquidity_usd'] > 1_000_000]
                         current = set(st.session_state["selected_pair_indices"])
@@ -3973,7 +3976,7 @@ def run_streamlit_panel():
                         st.rerun()
                 
                 with col_batch3:
-                    if st.button("❌ 取消全部选择", key="clear_selected_pairs", use_container_width=True):
+                    if st.button("❌ 取消全部选择", key="clear_selected_pairs", width='stretch'):
                         st.session_state["selected_pair_indices"] = []
                         st.rerun()
                 
@@ -4001,11 +4004,11 @@ def run_streamlit_panel():
                         with col_cb:
                             checkbox_key = f"pair_checkbox_detailed_{idx}"
                             new_checked = st.checkbox(
-                                "",
+                                "选择",
                                 value=is_checked,
                                 key=checkbox_key,
                                 disabled=not selectable,
-                                label_visibility="collapsed",
+                                label_visibility="hidden",
                             )
                             # 更新选中状态
                             if new_checked and idx not in st.session_state["selected_pair_indices"]:
@@ -4077,91 +4080,153 @@ def run_streamlit_panel():
                         })
                     
                     if selected_display:
-                        st.dataframe(pd.DataFrame(selected_display), use_container_width=True, hide_index=True)
+                        st.dataframe(pd.DataFrame(selected_display), width='stretch', hide_index=True)
                 
                 # 添加到配置按钮（优化：更明确的反馈）
                 col_btn1, col_btn2, col_btn3 = st.columns([2, 1, 1])
                 with col_btn1:
-                    if st.button("✅ 添加选中的交易对到监控配置", type="primary", use_container_width=True):
-                        added_count = 0
-                        skipped_count = 0
-                        skipped_details = []
-                        
-                        for idx in selected_indices:
-                            p = collected_pairs[idx]
-                            base_sym = p["base_token"]["symbol"]
-                            quote_sym = p["quote_token"]["symbol"]
-                            pair_name = f"{base_sym}/{quote_sym}"
+                    if st.button("✅ 添加选中的交易对到监控配置", type="primary", width='stretch'):
+                        try:
+                            # 获取默认值（从侧边栏或 session state）
+                            default_anchor_val = st.session_state.get("default_anchor", DEFAULT_ANCHOR_PRICE)
+                            default_threshold_val = st.session_state.get("global_threshold", DEFAULT_THRESHOLD)
                             
-                            # 检查是否已存在
-                            exists = any(
-                                cfg.get("chain") == p["chain"] 
-                                and cfg.get("pair_address") == p["pair_address"]
-                                for cfg in st.session_state["stable_configs"]
-                            )
+                            # 验证必要数据
+                            if not selected_indices:
+                                st.warning("⚠️ 请先选择要添加的交易对")
+                                st.stop()
                             
-                            if exists:
-                                skipped_count += 1
-                                skipped_details.append(f"{pair_name} ({p['chain']})")
-                                continue
+                            if "collected_pairs_cache" not in st.session_state or not st.session_state["collected_pairs_cache"]:
+                                st.error("❌ 采集结果已丢失，请重新采集")
+                                st.stop()
                             
-                            new_cfg = {
-                                "name": pair_name,
-                                "chain": p["chain"],
-                                "pair_address": p["pair_address"],
-                                "anchor_price": default_anchor,
-                                "threshold": default_threshold,
-                            }
-                            st.session_state["stable_configs"].append(new_cfg)
-                            added_count += 1
-                        
-                        save_stable_configs(st.session_state["stable_configs"])
-                        
-                        # 更详细的成功提示
-                        if added_count > 0:
-                            st.success(f"✅ 成功添加 **{added_count}** 个交易对到监控配置！")
-                            st.info("💡 提示：配置已保存，请查看主界面查看监控数据。页面将自动刷新...")
-                            if skipped_count > 0:
-                                st.info(f"ℹ️ 跳过 {skipped_count} 个已存在的配置：{', '.join(skipped_details[:5])}" + 
-                                       (f" 等 {skipped_count} 个" if skipped_count > 5 else ""))
+                            collected_pairs = st.session_state["collected_pairs_cache"]
                             
-                            # 重新加载配置，确保界面显示最新数据
-                            st.session_state["stable_configs"] = load_stable_configs()
+                            added_count = 0
+                            skipped_count = 0
+                            skipped_details = []
+                            error_details = []
                             
-                            # 更新采集结果缓存（移除已添加的项，保留未添加的）
-                            remaining_pairs = []
-                            for idx, p in enumerate(collected_pairs):
-                                if idx not in selected_indices:
-                                    # 未选中的保留
-                                    remaining_pairs.append(p)
-                                else:
-                                    # 检查是否成功添加（可能因为已存在而跳过）
+                            for idx in selected_indices:
+                                try:
+                                    # 验证索引有效性
+                                    if idx >= len(collected_pairs):
+                                        error_details.append(f"索引 {idx} 超出范围")
+                                        continue
+                                    
+                                    p = collected_pairs[idx]
+                                    
+                                    # 验证必要字段
+                                    if not p.get("chain") or not p.get("pair_address"):
+                                        error_details.append(f"索引 {idx}: 缺少必要字段（chain 或 pair_address）")
+                                        continue
+                                    
+                                    base_sym = p.get("base_token", {}).get("symbol", "")
+                                    quote_sym = p.get("quote_token", {}).get("symbol", "")
+                                    
+                                    if not base_sym or not quote_sym:
+                                        error_details.append(f"索引 {idx}: 缺少代币符号")
+                                        continue
+                                    
+                                    pair_name = f"{base_sym}/{quote_sym}"
+                                    
+                                    # 检查是否已存在
                                     exists = any(
                                         cfg.get("chain") == p["chain"] 
                                         and cfg.get("pair_address") == p["pair_address"]
                                         for cfg in st.session_state["stable_configs"]
                                     )
-                                    if not exists:
-                                        # 如果添加失败（可能因为已存在），也保留
-                                        remaining_pairs.append(p)
+                                    
+                                    if exists:
+                                        skipped_count += 1
+                                        skipped_details.append(f"{pair_name} ({p['chain']})")
+                                        continue
+                                    
+                                    new_cfg = {
+                                        "name": pair_name,
+                                        "chain": p["chain"],
+                                        "pair_address": p["pair_address"],
+                                        "anchor_price": float(default_anchor_val),
+                                        "threshold": float(default_threshold_val),
+                                    }
+                                    st.session_state["stable_configs"].append(new_cfg)
+                                    added_count += 1
+                                    
+                                except Exception as e:
+                                    error_details.append(f"索引 {idx}: {str(e)}")
+                                    logger.error(f"添加配置时出错（索引 {idx}）: {e}", exc_info=True)
+                                    continue
                             
-                            # 更新缓存
-                            st.session_state["collected_pairs_cache"] = remaining_pairs
-                            save_collected_pairs_cache(remaining_pairs)
-                        else:
-                            st.warning(f"⚠️ 没有添加任何交易对（所有 {skipped_count} 个都已存在）")
+                            # 保存配置
+                            try:
+                                save_stable_configs(st.session_state["stable_configs"])
+                            except Exception as e:
+                                st.error(f"❌ 保存配置失败: {e}")
+                                logger.error(f"保存配置失败: {e}", exc_info=True)
+                                st.stop()
                         
-                        # 清空选中状态（但保留采集结果，方便继续操作）
-                        st.session_state["selected_pair_indices"] = []
-                        st.rerun()
+                            # 更详细的成功提示
+                            if added_count > 0:
+                                st.success(f"✅ 成功添加 **{added_count}** 个交易对到监控配置！")
+                                st.info("💡 提示：配置已保存，请查看主界面查看监控数据。页面将自动刷新...")
+                                if skipped_count > 0:
+                                    st.info(f"ℹ️ 跳过 {skipped_count} 个已存在的配置：{', '.join(skipped_details[:5])}" + 
+                                           (f" 等 {skipped_count} 个" if skipped_count > 5 else ""))
+                                
+                                # 重新加载配置，确保界面显示最新数据
+                                st.session_state["stable_configs"] = load_stable_configs()
+                                
+                                # 更新采集结果缓存（移除已添加的项，保留未添加的）
+                                remaining_pairs = []
+                                for idx, p in enumerate(collected_pairs):
+                                    if idx not in selected_indices:
+                                        # 未选中的保留
+                                        remaining_pairs.append(p)
+                                    else:
+                                        # 检查是否成功添加（可能因为已存在而跳过）
+                                        exists = any(
+                                            cfg.get("chain") == p.get("chain") 
+                                            and cfg.get("pair_address") == p.get("pair_address")
+                                            for cfg in st.session_state["stable_configs"]
+                                        )
+                                        if not exists:
+                                            # 如果添加失败（可能因为已存在），也保留
+                                            remaining_pairs.append(p)
+                                
+                                # 更新缓存
+                                st.session_state["collected_pairs_cache"] = remaining_pairs
+                                save_collected_pairs_cache(remaining_pairs)
+                            else:
+                                if skipped_count > 0:
+                                    st.warning(f"⚠️ 没有添加任何交易对（所有 {skipped_count} 个都已存在）")
+                                else:
+                                    st.warning("⚠️ 没有添加任何交易对")
+                            
+                            # 显示错误信息（如果有）
+                            if error_details:
+                                st.error(f"❌ 添加过程中出现 {len(error_details)} 个错误：")
+                                with st.expander("查看错误详情"):
+                                    for err in error_details[:10]:  # 最多显示10个错误
+                                        st.text(err)
+                            
+                            # 清空选中状态（但保留采集结果，方便继续操作）
+                            st.session_state["selected_pair_indices"] = []
+                            st.rerun()
+                            
+                        except Exception as e:
+                            st.error(f"❌ 添加配置时发生错误: {e}")
+                            logger.error(f"添加配置时发生错误: {e}", exc_info=True)
+                            with st.expander("查看错误详情"):
+                                import traceback
+                                st.code(traceback.format_exc())
                 
                 with col_btn2:
-                    if st.button("🗑️ 清空选择", use_container_width=True):
+                    if st.button("🗑️ 清空选择", width='stretch'):
                         st.session_state["selected_pair_indices"] = []
                         st.rerun()
                 
                 with col_btn3:
-                    if st.button("🔄 重新采集", use_container_width=True, help="清空当前结果，重新开始采集"):
+                    if st.button("🔄 重新采集", width='stretch', help="清空当前结果，重新开始采集"):
                         st.session_state["collected_pairs_cache"] = []
                         st.session_state["selected_pair_indices"] = []
                         # 同时清空文件缓存
@@ -4172,7 +4237,7 @@ def run_streamlit_panel():
                 
                 # 如果采集结果不为空但没有选中项，显示清空按钮
                 if collected_pairs:
-                    if st.button("🗑️ 清空所有采集结果", use_container_width=True, help="清空采集结果缓存（包括文件）"):
+                    if st.button("🗑️ 清空所有采集结果", width='stretch', help="清空采集结果缓存（包括文件）"):
                         st.session_state["collected_pairs_cache"] = []
                         st.session_state["selected_pair_indices"] = []
                         save_collected_pairs_cache([])
@@ -4264,13 +4329,8 @@ def run_streamlit_panel():
             st.rerun()  # 刷新界面
 
     # ----- 主体：获取数据并展示 -----
-    # 如果开启自动刷新，则通过 meta 标签让浏览器按间隔自动刷新页面
-    if st.session_state.get("auto_refresh"):
-        interval = max(5, int(st.session_state["check_interval"]))
-        st.markdown(
-            f"<meta http-equiv='refresh' content='{interval}'>",
-            unsafe_allow_html=True,
-        )
+    # 注意：自动刷新改为在函数末尾使用 time.sleep() + st.rerun() 实现
+    # 这样 Streamlit 可以智能地只更新变化的部分，而不是整个页面刷新
     stable_configs = st.session_state["stable_configs"]
     if not stable_configs:
         st.warning("当前没有任何监控配置，请在左侧面板添加至少一个稳定币。")
@@ -4540,7 +4600,7 @@ def run_streamlit_panel():
             "threshold": "阈值(%)",
         })
         .style.apply(highlight_alerts, axis=1),
-        use_container_width=True,
+        width='stretch',
         height=400,
     )
     
@@ -4570,7 +4630,7 @@ def run_streamlit_panel():
                         button_help = f"价格: ${price:.4f}" + (" - 价格异常，可能不是稳定币" if is_suspicious else "")
                         
                         if st.button(button_label, key=f"quick_del_{item_idx}", 
-                                   help=button_help, use_container_width=True):
+                                   help=button_help, width='stretch'):
                             # 快速删除
                             configs_to_keep = [
                                 cfg for cfg in st.session_state["stable_configs"]
@@ -4596,7 +4656,7 @@ def run_streamlit_panel():
                 )
             with col_btn:
                 st.write("")  # 占位，对齐按钮
-                if st.button("🗑️ 删除", type="primary", use_container_width=True):
+                if st.button("🗑️ 删除", type="primary", width='stretch'):
                     # 解析选中的项目
                     selected_idx = delete_options.index(selected_to_delete)
                     row_to_delete = df.iloc[selected_idx]
@@ -4627,7 +4687,7 @@ def run_streamlit_panel():
         with col_warn:
             st.write("**建议立即清理，这些可能是误添加的非稳定币（如ETH、BTC等）**")
         with col_clean:
-            if st.button("🗑️ 一键清理所有异常", type="primary", use_container_width=True):
+            if st.button("🗑️ 一键清理所有异常", type="primary", width='stretch'):
                 # 收集所有异常项的 (name, chain)
                 items_to_remove = set()
                 for _, item in suspicious_items.iterrows():
@@ -4654,7 +4714,7 @@ def run_streamlit_panel():
             with col1:
                 st.error(f"**{item['name']} ({item['chain']})** - 价格: ${item['price']:.2f}")
             with col2:
-                if st.button(f"删除", key=f"del_suspicious_{idx}", use_container_width=True):
+                if st.button(f"删除", key=f"del_suspicious_{idx}", width='stretch'):
                     configs_to_keep = [
                         cfg for cfg in st.session_state["stable_configs"]
                         if not (cfg.get("name") == item["name"] and cfg.get("chain") == item["chain"])
@@ -4679,7 +4739,7 @@ def run_streamlit_panel():
                     "链": cfg.get("chain"),
                     "Pair地址": cfg.get("pair_address", "")[:20] + "...",
                 })
-            st.dataframe(pd.DataFrame(config_display), use_container_width=True)
+            st.dataframe(pd.DataFrame(config_display), width='stretch')
             
             # 查看原始 JSON
             if st.checkbox("查看原始 JSON 配置"):
@@ -4720,7 +4780,12 @@ def run_streamlit_panel():
             for s in statuses
         ]
     )
-    history_df = pd.concat([history_df, new_rows], ignore_index=True)
+    # 修复 FutureWarning: 检查 DataFrame 是否为空
+    if not new_rows.empty:
+        if history_df.empty:
+            history_df = new_rows.copy()
+        else:
+            history_df = pd.concat([history_df, new_rows], ignore_index=True)
     
     # 数据清理策略：保留最近 HISTORY_MAX_RECORDS 条或最近 24 小时的数据
     if len(history_df) > HISTORY_MAX_RECORDS:
@@ -5220,7 +5285,7 @@ def run_streamlit_panel():
         st.code(log_text, language="text")
         
         # 下载日志按钮
-        if st.button("📥 下载当前显示的日志", use_container_width=True):
+        if st.button("📥 下载当前显示的日志", width='stretch'):
             st.download_button(
                 label="点击下载",
                 data=log_text,
@@ -5235,7 +5300,7 @@ def run_streamlit_panel():
             st.info("没有匹配的日志记录（请调整过滤条件）")
     
     # 刷新按钮
-    if st.button("🔄 刷新日志", use_container_width=True):
+    if st.button("🔄 刷新日志", width='stretch'):
         st.rerun()
 
 
