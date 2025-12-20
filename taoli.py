@@ -4205,31 +4205,41 @@ def run_streamlit_panel():
                                         f"期望总数: {config_count_before_add + added_count}"
                                     )
                             
-                            # 保存配置
-                            try:
-                                config_count_before_save = len(st.session_state["stable_configs"])
-                                save_stable_configs(st.session_state["stable_configs"])
-                                logger.info(f"保存配置成功，保存前数量: {config_count_before_save}")
-                                
-                                # 验证保存是否成功：立即重新加载并检查
-                                loaded_configs = load_stable_configs()
-                                config_count_after_load = len(loaded_configs)
-                                logger.info(f"重新加载配置成功，加载后数量: {config_count_after_load}")
-                                
-                                if config_count_after_load != config_count_before_save:
-                                    st.warning(
-                                        f"⚠️ 配置数量不匹配！保存前: {config_count_before_save} 个，"
-                                        f"加载后: {config_count_after_load} 个。"
-                                        f"请检查配置文件 {CONFIG_FILE} 是否正确。"
-                                    )
-                                    logger.warning(
-                                        f"配置数量不匹配！保存前: {config_count_before_save}，"
-                                        f"加载后: {config_count_after_load}"
-                                    )
-                            except Exception as e:
-                                st.error(f"❌ 保存配置失败: {e}")
-                                logger.error(f"保存配置失败: {e}", exc_info=True)
-                                st.stop()
+                            # 保存配置（只有成功添加了配置才保存到文件）
+                            if added_count > 0:
+                                try:
+                                    config_count_before_save = len(st.session_state["stable_configs"])
+                                    logger.info(f"准备保存配置到文件，当前配置数量: {config_count_before_save}")
+                                    
+                                    # 保存到文件
+                                    save_stable_configs(st.session_state["stable_configs"])
+                                    logger.info(f"✅ 配置已保存到文件 {CONFIG_FILE}，保存前数量: {config_count_before_save}")
+                                    
+                                    # 验证保存是否成功：立即重新加载并检查
+                                    loaded_configs = load_stable_configs()
+                                    config_count_after_load = len(loaded_configs)
+                                    logger.info(f"验证保存结果：重新加载配置成功，加载后数量: {config_count_after_load}")
+                                    
+                                    if config_count_after_load != config_count_before_save:
+                                        error_msg = (
+                                            f"⚠️ 配置数量不匹配！保存前: {config_count_before_save} 个，"
+                                            f"加载后: {config_count_after_load} 个。"
+                                            f"请检查配置文件 {CONFIG_FILE} 是否正确。"
+                                        )
+                                        st.error(error_msg)
+                                        logger.error(
+                                            f"配置数量不匹配！保存前: {config_count_before_save}，"
+                                            f"加载后: {config_count_after_load}"
+                                        )
+                                    else:
+                                        logger.info(f"✅ 配置文件验证成功：数量匹配 ({config_count_after_load} 个)")
+                                except Exception as e:
+                                    error_msg = f"❌ 保存配置失败: {e}"
+                                    st.error(error_msg)
+                                    logger.error(f"保存配置失败: {e}", exc_info=True)
+                                    # 不停止执行，让用户知道保存失败
+                            else:
+                                logger.info("没有需要保存的配置（added_count=0，可能所有配置都已存在）")
                         
                             # 更详细的成功提示
                             if added_count > 0:
