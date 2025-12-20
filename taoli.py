@@ -45,6 +45,7 @@ from functools import wraps
 from logging.handlers import RotatingFileHandler
 from typing import Any, Callable, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 
 # ========== 日志系统 ==========
@@ -96,6 +97,213 @@ def setup_logger(name: str = "taoli", log_dir: str = "logs") -> logging.Logger:
     return logger
 
 logger = setup_logger()
+
+
+# ========== API 速率限制配置（需要在类定义之前）=========
+# API 基础配置（需要在函数定义之前）
+API_TIMEOUT = 10  # API 请求超时（秒）
+API_RETRY_TIMES = 3  # API 重试次数
+
+# API 速率限制配置（用于自动采集功能）
+# 根据 DexScreener API 文档：
+# - /latest/dex/search: 300 requests/minute (5 req/s)
+# - /latest/dex/pairs/{chainId}/{pairId}: 300 requests/minute (5 req/s)
+# - /tokens/v1/{chainId}/{tokenAddresses}: 300 requests/minute (5 req/s)
+# 为了安全，设置为 4 req/s，留 20% 余量
+API_RATE_LIMIT_REQUESTS_PER_SECOND = 4.0  # 每秒请求数（基于 API 文档：300 req/min = 5 req/s，留余量）
+API_RATE_LIMIT_BURST = 10  # 突发请求允许数量（允许短时间内的额外请求）
+API_RATE_LIMIT_BACKOFF_FACTOR = 2.0  # 遇到限流时的退避倍数
+API_RATE_LIMIT_MAX_RETRY_DELAY = 60  # 最大重试延迟（秒）
+
+
+# ========== API 速率限制管理器 ==========
+
+class RateLimiter:
+    """
+    API 速率限制管理器（令牌桶算法）
+    用于控制 API 请求频率，避免触发限流
+    """
+    def __init__(
+        self,
+        requests_per_second: float = API_RATE_LIMIT_REQUESTS_PER_SECOND,
+        burst_size: int = API_RATE_LIMIT_BURST,
+    ):
+        self.requests_per_second = requests_per_second
+        self.burst_size = burst_size
+        self.min_interval = 1.0 / requests_per_second  # 最小请求间隔（秒）
+        self.tokens = float(burst_size)  # 当前可用令牌数
+        self.last_refill_time = time.time()  # 上次补充令牌的时间
+        self.last_request_time = 0.0  # 上次请求时间
+        self.total_requests = 0  # 总请求数
+        self.rate_limited_count = 0  # 被限流的次数
+        self.lock = threading.Lock()  # 线程锁
+    
+    def _refill_tokens(self):
+        """补充令牌（令牌桶算法）"""
+        now = time.time()
+        elapsed = now - self.last_refill_time
+        if elapsed > 0:
+            # 根据时间流逝补充令牌
+            new_tokens = elapsed * self.requests_per_second
+            self.tokens = min(self.burst_size, self.tokens + new_tokens)
+            self.last_refill_time = now
+    
+    def acquire(self, wait: bool = True) -> bool:
+        """
+        获取令牌（如果可用则立即返回，否则等待或返回 False）
+        
+        参数:
+            wait: 如果令牌不可用，是否等待
+        
+        返回:
+            True 表示可以发起请求，False 表示被限流（如果 wait=False）
+        """
+        with self.lock:
+            self._refill_tokens()
+            
+            # 检查是否有可用令牌
+            if self.tokens >= 1.0:
+                self.tokens -= 1.0
+                self.last_request_time = time.time()
+                self.total_requests += 1
+                return True
+            
+            # 计算需要等待的时间
+            wait_time = self.min_interval - (time.time() - self.last_request_time)
+            if wait_time > 0:
+                if wait:
+                    time.sleep(wait_time)
+                    # 等待后重新尝试
+                    self._refill_tokens()
+                    if self.tokens >= 1.0:
+                        self.tokens -= 1.0
+                        self.last_request_time = time.time()
+                        self.total_requests += 1
+                        return True
+                    else:
+                        self.rate_limited_count += 1
+                        return False
+                else:
+                    self.rate_limited_count += 1
+                    return False
+            
+            # 可以直接请求
+            self.tokens -= 1.0
+            self.last_request_time = time.time()
+            self.total_requests += 1
+            return True
+    
+    def wait_if_needed(self):
+        """如果需要，等待直到可以发起请求"""
+        self.acquire(wait=True)
+    
+    def get_stats(self) -> dict:
+        """获取统计信息"""
+        with self.lock:
+            return {
+                "total_requests": self.total_requests,
+                "rate_limited_count": self.rate_limited_count,
+                "current_tokens": self.tokens,
+                "requests_per_second": self.requests_per_second,
+            }
+
+
+# 全局速率限制器实例（用于自动采集）
+_dexscreener_rate_limiter = RateLimiter(
+    requests_per_second=API_RATE_LIMIT_REQUESTS_PER_SECOND,
+    burst_size=API_RATE_LIMIT_BURST,
+)
+
+
+def make_rate_limited_request(
+    url: str,
+    params: dict | None = None,
+    headers: dict | None = None,
+    timeout: int = API_TIMEOUT,
+    rate_limiter: RateLimiter | None = None,
+    max_retries: int = API_RETRY_TIMES,
+) -> requests.Response:
+    """
+    带速率限制的 HTTP 请求
+    
+    参数:
+        url: 请求 URL
+        params: 查询参数
+        headers: 请求头
+        timeout: 超时时间
+        rate_limiter: 速率限制器（如果为 None 则使用全局限制器）
+        max_retries: 最大重试次数
+    
+    返回:
+        Response 对象
+    
+    异常:
+        requests.RequestException: 请求失败
+    """
+    if rate_limiter is None:
+        rate_limiter = _dexscreener_rate_limiter
+    
+    retry_count = 0
+    base_delay = 1.0
+    
+    while retry_count <= max_retries:
+        try:
+            # 等待速率限制器许可
+            rate_limiter.wait_if_needed()
+            
+            # 发起请求
+            resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+            
+            # 检查是否被限流（429 Too Many Requests）
+            if resp.status_code == 429:
+                # 尝试从响应头获取重试延迟时间
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        wait_time = float(retry_after)
+                    except ValueError:
+                        wait_time = base_delay * (API_RATE_LIMIT_BACKOFF_FACTOR ** retry_count)
+                else:
+                    # 指数退避
+                    wait_time = min(
+                        base_delay * (API_RATE_LIMIT_BACKOFF_FACTOR ** retry_count),
+                        API_RATE_LIMIT_MAX_RETRY_DELAY
+                    )
+                
+                logger.warning(f"API 限流（429），等待 {wait_time:.1f} 秒后重试（第 {retry_count + 1}/{max_retries + 1} 次）")
+                rate_limiter.rate_limited_count += 1
+                
+                if retry_count < max_retries:
+                    time.sleep(wait_time)
+                    retry_count += 1
+                    continue
+                else:
+                    resp.raise_for_status()
+            
+            # 其他错误直接抛出
+            resp.raise_for_status()
+            return resp
+            
+        except requests.exceptions.Timeout:
+            retry_count += 1
+            if retry_count <= max_retries:
+                wait_time = base_delay * (API_RATE_LIMIT_BACKOFF_FACTOR ** (retry_count - 1))
+                logger.warning(f"请求超时，等待 {wait_time:.1f} 秒后重试（第 {retry_count}/{max_retries + 1} 次）")
+                time.sleep(wait_time)
+            else:
+                raise
+        
+        except requests.exceptions.RequestException as e:
+            retry_count += 1
+            if retry_count <= max_retries:
+                wait_time = base_delay * (API_RATE_LIMIT_BACKOFF_FACTOR ** (retry_count - 1))
+                logger.warning(f"请求失败: {e}，等待 {wait_time:.1f} 秒后重试（第 {retry_count}/{max_retries + 1} 次）")
+                time.sleep(wait_time)
+            else:
+                raise
+    
+    # 所有重试都失败了
+    raise requests.exceptions.RequestException(f"请求失败，已重试 {max_retries + 1} 次")
 
 
 # ========== API 缓存系统 ==========
@@ -234,6 +442,7 @@ NOTIFY_CONFIG_FILE = os.path.join(CONFIG_DIR, "notify_config.json")
 USERS_CONFIG_FILE = os.path.join(CONFIG_DIR, "users.json")
 CUSTOM_STABLE_SYMBOLS_FILE = os.path.join(CONFIG_DIR, "custom_stable_symbols.json")
 SEND_LOG_FILE = os.path.join(CONFIG_DIR, "send_log.json")  # 发送日志文件
+COLLECTED_PAIRS_CACHE_FILE = os.path.join(CONFIG_DIR, "collected_pairs_cache.json")  # 采集结果缓存文件
 
 # 通知配置（套利优化）
 MAX_DAILY_SENDS = 5  # Server酱每天最多5条（免费限制）
@@ -247,8 +456,6 @@ if not os.path.exists(CONFIG_DIR):
     logger.info(f"创建配置目录: {CONFIG_DIR}")
 
 # API 配置（性能优化）
-API_TIMEOUT = 10  # API 请求超时（秒）
-API_RETRY_TIMES = 3  # API 重试次数
 MAX_CONCURRENT_REQUESTS = 5  # 最大并发请求数（降低到5避免触发限流）
 
 # 缓存配置（分级策略）
@@ -865,6 +1072,40 @@ def save_users(users: list[dict]) -> None:
         logger.error(f"保存 {USERS_CONFIG_FILE} 失败: {e}")
 
 
+def load_collected_pairs_cache() -> list[dict]:
+    """
+    从本地 JSON 文件加载采集结果缓存。
+    如果文件不存在或损坏，返回空列表。
+    """
+    if os.path.exists(COLLECTED_PAIRS_CACHE_FILE):
+        try:
+            with open(COLLECTED_PAIRS_CACHE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                logger.debug(f"成功加载 {len(data)} 个采集结果缓存")
+                return data
+            else:
+                logger.warning(f"{COLLECTED_PAIRS_CACHE_FILE} 内容格式异常，需为 list")
+        except json.JSONDecodeError as e:
+            logger.error(f"采集结果缓存文件 JSON 格式错误: {e}")
+        except Exception as e:
+            logger.error(f"读取 {COLLECTED_PAIRS_CACHE_FILE} 失败: {e}")
+    return []
+
+
+def save_collected_pairs_cache(pairs: list[dict]) -> None:
+    """
+    将采集结果保存到本地 JSON 文件，实现持久化。
+    """
+    try:
+        os.makedirs(os.path.dirname(COLLECTED_PAIRS_CACHE_FILE), exist_ok=True)
+        with open(COLLECTED_PAIRS_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(pairs, f, ensure_ascii=False, indent=2)
+        logger.info(f"已保存 {len(pairs)} 个采集结果到 {COLLECTED_PAIRS_CACHE_FILE}")
+    except Exception as e:
+        logger.error(f"保存 {COLLECTED_PAIRS_CACHE_FILE} 失败: {e}")
+
+
 @cached(ttl=CACHE_TTL_GLOBAL)
 def get_coingecko_prices(symbols: list[str]) -> dict[str, float]:
     """
@@ -1011,12 +1252,17 @@ def get_available_chains_from_api() -> list[str]:
     test_queries = ["USDT/USDC", "ETH/USDT", "BTC/USDT", "USDC/DAI"]
     chains_found: set[str] = set()
     
-    print("[链列表] 正在从 DexScreener API 获取支持的链列表...")
+    logger.info("[链列表] 正在从 DexScreener API 获取支持的链列表...")
     for query in test_queries:
         try:
             url = "https://api.dexscreener.com/latest/dex/search"
-            resp = requests.get(url, params={"q": query}, timeout=10)
-            resp.raise_for_status()
+            # 使用速率限制的请求函数
+            resp = make_rate_limited_request(
+                url,
+                params={"q": query},
+                timeout=API_TIMEOUT,
+                rate_limiter=_dexscreener_rate_limiter,
+            )
             data = resp.json()
             
             pairs = data.get("pairs", [])
@@ -1025,14 +1271,14 @@ def get_available_chains_from_api() -> list[str]:
                 if chain_id:
                     chains_found.add(chain_id)
         except Exception as e:
-            print(f"[链列表] 搜索 {query} 时出错: {e}")
+            logger.warning(f"[链列表] 搜索 {query} 时出错: {e}")
             continue
     
     # 如果 API 没有返回足够的链，合并已知的链列表
     known_chains = set(CHAIN_NAME_TO_ID.keys())
     chains_found = chains_found.union(known_chains)
     
-    print(f"[链列表] 找到 {len(chains_found)} 条链")
+    logger.info(f"[链列表] 找到 {len(chains_found)} 条链")
     
     # 按字母顺序排序
     return sorted(list(chains_found))
@@ -1087,11 +1333,16 @@ def search_stablecoin_pairs(
     # 去重，避免重复搜索
     search_queries = list(set(search_queries))
     
-    for query in search_queries:
+    for query_idx, query in enumerate(search_queries, 1):
         try:
             url = "https://api.dexscreener.com/latest/dex/search"
-            resp = requests.get(url, params={"q": query}, timeout=10)
-            resp.raise_for_status()
+            # 使用速率限制的请求函数
+            resp = make_rate_limited_request(
+                url,
+                params={"q": query},
+                timeout=API_TIMEOUT,
+                rate_limiter=_dexscreener_rate_limiter,
+            )
             data = resp.json()
             
             pairs = data.get("pairs", [])
@@ -1172,7 +1423,7 @@ def search_stablecoin_pairs(
                 
                 results.append(pair_data)
         except Exception as e:
-            print(f"[自动采集] 搜索 {query} 失败: {e}")
+            logger.warning(f"[自动采集] 搜索 {query} 失败: {e}")
             continue
     
     # 方法2: 如果知道稳定币的 token 地址，可以使用 /tokens/v1 API
@@ -1203,34 +1454,67 @@ def auto_collect_stablecoin_pairs(
     chains: list[str] | None = None,
     min_liquidity_usd: float = 10000.0,
     max_results_per_symbol: int = 10,
-) -> list[dict]:
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> tuple[list[dict], dict]:
     """
-    自动采集多个稳定币的交易对。
+    自动采集多个稳定币的交易对（带速率限制和进度显示）。
     
     参数:
         stable_symbols: 要采集的稳定币符号列表，如果为 None 则使用默认的主流稳定币
         chains: 要搜索的链列表，如果为 None 则搜索所有支持的链
         min_liquidity_usd: 最小流动性要求（USD）
         max_results_per_symbol: 每个稳定币最多返回的结果数
+        progress_callback: 进度回调函数，格式为 (current, total, message) -> None
     
     返回:
-        所有找到的交易对列表
+        (交易对列表, 统计信息字典)
+        统计信息包含：
+        - total_symbols: 总稳定币数
+        - total_pairs_found: 找到的交易对总数（去重前）
+        - unique_pairs: 去重后的交易对数
+        - errors: 错误数量
+        - rate_limit_stats: 速率限制统计
     """
     if stable_symbols is None:
         stable_symbols = list(STABLE_SYMBOLS)
     
+    total_symbols = len(stable_symbols)
     all_results: list[dict] = []
+    error_count = 0
     
-    for symbol in stable_symbols:
-        print(f"[自动采集] 正在搜索 {symbol} 的交易对...")
-        pairs = search_stablecoin_pairs(
-            stable_symbol=symbol,
-            chains=chains,
-            min_liquidity_usd=min_liquidity_usd,
-            max_results_per_chain=max_results_per_symbol,
-        )
-        all_results.extend(pairs)
-        print(f"[自动采集] {symbol} 找到 {len(pairs)} 个交易对")
+    # 重置速率限制器统计（用于本次采集）
+    rate_limiter_stats_before = _dexscreener_rate_limiter.get_stats()
+    
+    logger.info(f"[自动采集] 开始采集 {total_symbols} 个稳定币的交易对，速率限制: {API_RATE_LIMIT_REQUESTS_PER_SECOND} 次/秒")
+    
+    for idx, symbol in enumerate(stable_symbols, 1):
+        try:
+            progress_msg = f"正在搜索 {symbol} 的交易对... ({idx}/{total_symbols})"
+            if progress_callback:
+                progress_callback(idx, total_symbols, progress_msg)
+            else:
+                logger.info(f"[自动采集] {progress_msg}")
+            
+            pairs = search_stablecoin_pairs(
+                stable_symbol=symbol,
+                chains=chains,
+                min_liquidity_usd=min_liquidity_usd,
+                max_results_per_chain=max_results_per_symbol,
+            )
+            all_results.extend(pairs)
+            logger.info(f"[自动采集] {symbol} 找到 {len(pairs)} 个交易对")
+        except Exception as e:
+            error_count += 1
+            logger.error(f"[自动采集] 搜索 {symbol} 失败: {e}", exc_info=True)
+            if progress_callback:
+                progress_callback(idx, total_symbols, f"❌ {symbol} 搜索失败: {str(e)[:50]}")
+    
+    # 获取速率限制器统计（本次采集后）
+    rate_limiter_stats_after = _dexscreener_rate_limiter.get_stats()
+    rate_limit_stats = {
+        "requests_made": rate_limiter_stats_after["total_requests"] - rate_limiter_stats_before["total_requests"],
+        "rate_limited_count": rate_limiter_stats_after["rate_limited_count"] - rate_limiter_stats_before["rate_limited_count"],
+    }
     
     # 去重（基于 chain + pair_address）
     seen = set()
@@ -1241,7 +1525,17 @@ def auto_collect_stablecoin_pairs(
             seen.add(key)
             unique_results.append(r)
     
-    return unique_results
+    stats = {
+        "total_symbols": total_symbols,
+        "total_pairs_found": len(all_results),
+        "unique_pairs": len(unique_results),
+        "errors": error_count,
+        "rate_limit_stats": rate_limit_stats,
+    }
+    
+    logger.info(f"[自动采集] 采集完成: 找到 {len(unique_results)} 个唯一交易对，错误 {error_count} 个，限流 {rate_limit_stats['rate_limited_count']} 次")
+    
+    return unique_results, stats
 
 
 # ========== 数据获取与逻辑层 ==========
@@ -2849,9 +3143,10 @@ def run_streamlit_panel():
     # ----- 初始化 Session State -----
     if "check_interval" not in st.session_state:
         st.session_state["check_interval"] = DEFAULT_CHECK_INTERVAL
-    if "stable_configs" not in st.session_state:
-        # 优先从本地 JSON 加载；如无则用代码里的默认示例
-        st.session_state["stable_configs"] = load_stable_configs()
+    
+    # 每次页面加载时都重新从文件加载配置，确保显示最新数据
+    # 这样添加配置后能立即看到效果
+    st.session_state["stable_configs"] = load_stable_configs()
 
     # 用户配置（多用户通知分发）
     if "users" not in st.session_state:
@@ -3213,9 +3508,13 @@ def run_streamlit_panel():
         st.markdown("#### 🤖 自动采集稳定币对")
         st.caption("使用 DexScreener API 自动搜索并添加稳定币交易对")
         
-        # 初始化 session state
+        # 初始化 session state（从文件加载采集结果，实现持久化）
         if "collected_pairs_cache" not in st.session_state:
-            st.session_state["collected_pairs_cache"] = []
+            # 从文件加载之前保存的采集结果
+            cached_pairs = load_collected_pairs_cache()
+            st.session_state["collected_pairs_cache"] = cached_pairs
+            if cached_pairs:
+                logger.info(f"已从文件恢复 {len(cached_pairs)} 个采集结果")
         if "available_chains" not in st.session_state:
             # 第一次初始化时，直接使用已知的链列表（不为空）
             st.session_state["available_chains"] = list(CHAIN_NAME_TO_ID.keys())
@@ -3358,25 +3657,66 @@ def run_streamlit_panel():
                     st.write(", ".join(auto_chains))
                     st.write(f"**最小流动性**: ${auto_min_liq:,.0f}")
                 
-                with st.spinner(f"正在自动采集 {len(auto_symbols)} 个稳定币在 {len(auto_chains)} 条链上的交易对..."):
-                    try:
-                        collected_pairs = auto_collect_stablecoin_pairs(
-                            stable_symbols=auto_symbols,
-                            chains=auto_chains,
-                            min_liquidity_usd=float(auto_min_liq),
-                            max_results_per_symbol=10,
+                # 创建进度条和状态容器
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                try:
+                    # 进度回调函数
+                    def update_progress(current: int, total: int, message: str):
+                        progress = current / total
+                        progress_bar.progress(progress)
+                        status_text.text(f"📊 {message} ({current}/{total})")
+                    
+                    # 执行采集（带速率限制）
+                    collected_pairs, stats = auto_collect_stablecoin_pairs(
+                        stable_symbols=auto_symbols,
+                        chains=auto_chains,
+                        min_liquidity_usd=float(auto_min_liq),
+                        max_results_per_symbol=10,
+                        progress_callback=update_progress,
+                    )
+                    
+                    # 完成进度条
+                    progress_bar.progress(1.0)
+                    
+                    # 保存到 session state 和文件（实现持久化）
+                    st.session_state["collected_pairs_cache"] = collected_pairs
+                    st.session_state["collection_stats"] = stats
+                    # 持久化保存到文件
+                    save_collected_pairs_cache(collected_pairs)
+                    
+                    # 显示统计信息
+                    if not collected_pairs:
+                        status_text.warning("❌ 未找到符合条件的交易对，请尝试降低流动性要求或选择其他链")
+                    else:
+                        status_text.success(
+                            f"✅ 采集完成！找到 **{stats['unique_pairs']}** 个符合条件的交易对\n"
+                            f"📊 统计: 搜索 {stats['total_symbols']} 个稳定币，"
+                            f"共找到 {stats['total_pairs_found']} 个交易对（去重后 {stats['unique_pairs']} 个），"
+                            f"错误 {stats['errors']} 个，限流 {stats['rate_limit_stats']['rate_limited_count']} 次"
                         )
                         
-                        # 保存到 session state
-                        st.session_state["collected_pairs_cache"] = collected_pairs
+                        # 显示速率限制统计
+                        if stats['rate_limit_stats']['rate_limited_count'] > 0:
+                            st.warning(
+                                f"⚠️ 检测到 {stats['rate_limit_stats']['rate_limited_count']} 次 API 限流，"
+                                f"已自动重试。建议减少并发或降低请求频率。"
+                            )
                         
-                        if not collected_pairs:
-                            st.warning("未找到符合条件的交易对，请尝试降低流动性要求或选择其他链")
-                        else:
-                            st.success(f"找到 {len(collected_pairs)} 个符合条件的交易对")
-                    except Exception as e:
-                        st.error(f"自动采集失败: {e}")
-                        import traceback
+                        # 显示详细的速率限制信息
+                        with st.expander("📈 查看详细统计信息", expanded=False):
+                            st.json(stats)
+                    
+                    # 清除进度条
+                    time.sleep(0.5)  # 短暂显示完成状态
+                    progress_bar.empty()
+                    
+                except Exception as e:
+                    progress_bar.empty()
+                    status_text.error(f"❌ 自动采集失败: {e}")
+                    import traceback
+                    with st.expander("🔍 查看错误详情"):
                         st.code(traceback.format_exc())
         
         # 显示采集结果，支持多选勾选（优化：使用表格显示，性能更好）
@@ -3651,14 +3991,38 @@ def run_streamlit_panel():
                         # 更详细的成功提示
                         if added_count > 0:
                             st.success(f"✅ 成功添加 **{added_count}** 个交易对到监控配置！")
+                            st.info("💡 提示：配置已保存，请查看主界面查看监控数据。页面将自动刷新...")
                             if skipped_count > 0:
                                 st.info(f"ℹ️ 跳过 {skipped_count} 个已存在的配置：{', '.join(skipped_details[:5])}" + 
                                        (f" 等 {skipped_count} 个" if skipped_count > 5 else ""))
+                            
+                            # 重新加载配置，确保界面显示最新数据
+                            st.session_state["stable_configs"] = load_stable_configs()
+                            
+                            # 更新采集结果缓存（移除已添加的项，保留未添加的）
+                            remaining_pairs = []
+                            for idx, p in enumerate(collected_pairs):
+                                if idx not in selected_indices:
+                                    # 未选中的保留
+                                    remaining_pairs.append(p)
+                                else:
+                                    # 检查是否成功添加（可能因为已存在而跳过）
+                                    exists = any(
+                                        cfg.get("chain") == p["chain"] 
+                                        and cfg.get("pair_address") == p["pair_address"]
+                                        for cfg in st.session_state["stable_configs"]
+                                    )
+                                    if not exists:
+                                        # 如果添加失败（可能因为已存在），也保留
+                                        remaining_pairs.append(p)
+                            
+                            # 更新缓存
+                            st.session_state["collected_pairs_cache"] = remaining_pairs
+                            save_collected_pairs_cache(remaining_pairs)
                         else:
                             st.warning(f"⚠️ 没有添加任何交易对（所有 {skipped_count} 个都已存在）")
                         
-                        # 清空缓存和选中状态
-                        st.session_state["collected_pairs_cache"] = []
+                        # 清空选中状态（但保留采集结果，方便继续操作）
                         st.session_state["selected_pair_indices"] = []
                         st.rerun()
                 
@@ -3671,9 +4035,20 @@ def run_streamlit_panel():
                     if st.button("🔄 重新采集", use_container_width=True, help="清空当前结果，重新开始采集"):
                         st.session_state["collected_pairs_cache"] = []
                         st.session_state["selected_pair_indices"] = []
+                        # 同时清空文件缓存
+                        save_collected_pairs_cache([])
                         st.rerun()
             else:
                 st.info("💡 提示：请从上方列表中选择要添加的交易对")
+                
+                # 如果采集结果不为空但没有选中项，显示清空按钮
+                if collected_pairs:
+                    if st.button("🗑️ 清空所有采集结果", use_container_width=True, help="清空采集结果缓存（包括文件）"):
+                        st.session_state["collected_pairs_cache"] = []
+                        st.session_state["selected_pair_indices"] = []
+                        save_collected_pairs_cache([])
+                        st.success("✅ 已清空所有采集结果")
+                        st.rerun()
         
         st.markdown("---")
 
