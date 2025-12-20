@@ -4154,6 +4154,7 @@ def run_streamlit_panel():
                                     if exists:
                                         skipped_count += 1
                                         skipped_details.append(f"{pair_name} ({p['chain']})")
+                                        logger.debug(f"跳过已存在的配置: {pair_name} on {p['chain']}, pair_address={p['pair_address'][:20]}...")
                                         continue
                                     
                                     # 确保使用采集数据中的链信息（而不是任何默认值）
@@ -4181,18 +4182,28 @@ def run_streamlit_panel():
                             # 一次性添加所有配置
                             if configs_to_add:
                                 # 记录要添加的配置信息（用于调试）
+                                logger.info(f"准备添加 {len(configs_to_add)} 个配置到 session_state")
                                 for cfg in configs_to_add:
                                     logger.info(
-                                        f"添加配置: name={cfg['name']}, chain={cfg['chain']}, "
+                                        f"  - 添加配置: name={cfg['name']}, chain={cfg['chain']}, "
                                         f"pair_address={cfg['pair_address'][:20]}..."
                                     )
                                 
+                                config_count_before_add = len(st.session_state["stable_configs"])
                                 st.session_state["stable_configs"].extend(configs_to_add)
                                 added_count = len(configs_to_add)
+                                config_count_after_add = len(st.session_state["stable_configs"])
                                 logger.info(
-                                    f"准备添加 {added_count} 个配置到 session_state，"
-                                    f"当前总数: {len(st.session_state['stable_configs'])}"
+                                    f"添加完成: 添加了 {added_count} 个配置，"
+                                    f"添加前总数: {config_count_before_add}，添加后总数: {config_count_after_add}"
                                 )
+                                
+                                if config_count_after_add != config_count_before_add + added_count:
+                                    logger.error(
+                                        f"配置数量异常！添加前: {config_count_before_add}，"
+                                        f"添加数量: {added_count}，添加后: {config_count_after_add}，"
+                                        f"期望总数: {config_count_before_add + added_count}"
+                                    )
                             
                             # 保存配置
                             try:
@@ -4224,40 +4235,45 @@ def run_streamlit_panel():
                             if added_count > 0:
                                 st.success(f"✅ 成功添加 **{added_count}** 个交易对到监控配置！")
                                 st.info(f"💡 当前配置总数: **{len(st.session_state['stable_configs'])}** 个")
+                                if skipped_count > 0:
+                                    st.warning(
+                                        f"⚠️ 跳过了 {skipped_count} 个已存在的配置"
+                                        + (f"（前5个：{', '.join(skipped_details[:5])}" if skipped_count > 5 else f"：{', '.join(skipped_details)}")
+                                        + (f" 等 {skipped_count} 个）" if skipped_count > 5 else "）")
+                                    )
+                                    logger.info(f"跳过 {skipped_count} 个已存在的配置")
                                 st.info("💡 提示：配置已保存，请查看主界面查看监控数据。页面将自动刷新...")
-                                if skipped_count > 0:
-                                    st.info(f"ℹ️ 跳过 {skipped_count} 个已存在的配置：{', '.join(skipped_details[:5])}" + 
-                                           (f" 等 {skipped_count} 个" if skipped_count > 5 else ""))
-                                
-                                # 重新加载配置，确保界面显示最新数据
-                                st.session_state["stable_configs"] = load_stable_configs()
-                                logger.info(f"刷新后 session state 中的配置数量: {len(st.session_state['stable_configs'])}")
-                                
-                                # 更新采集结果缓存（移除已添加的项，保留未添加的）
-                                remaining_pairs = []
-                                for idx, p in enumerate(collected_pairs):
-                                    if idx not in selected_indices:
-                                        # 未选中的保留
-                                        remaining_pairs.append(p)
-                                    else:
-                                        # 检查是否成功添加（可能因为已存在而跳过）
-                                        exists = any(
-                                            cfg.get("chain") == p.get("chain") 
-                                            and cfg.get("pair_address") == p.get("pair_address")
-                                            for cfg in st.session_state["stable_configs"]
-                                        )
-                                        if not exists:
-                                            # 如果添加失败（可能因为已存在），也保留
-                                            remaining_pairs.append(p)
-                                
-                                # 更新缓存
-                                st.session_state["collected_pairs_cache"] = remaining_pairs
-                                save_collected_pairs_cache(remaining_pairs)
+                            elif skipped_count > 0:
+                                st.warning(f"⚠️ 没有添加任何配置，所有 {skipped_count} 个都已存在！")
+                                logger.warning(f"没有添加任何配置，所有 {skipped_count} 个都已存在")
                             else:
-                                if skipped_count > 0:
-                                    st.warning(f"⚠️ 没有添加任何交易对（所有 {skipped_count} 个都已存在）")
+                                st.warning("⚠️ 没有添加任何配置，请检查是否选中了要添加的交易对")
+                                logger.warning("没有添加任何配置，added_count=0, skipped_count=0")
+                            
+                            # 重新加载配置，确保界面显示最新数据（无论是否添加成功）
+                            st.session_state["stable_configs"] = load_stable_configs()
+                            logger.info(f"刷新后 session state 中的配置数量: {len(st.session_state['stable_configs'])}")
+                            
+                            # 更新采集结果缓存（移除已添加的项，保留未添加的）
+                            remaining_pairs = []
+                            for idx, p in enumerate(collected_pairs):
+                                if idx not in selected_indices:
+                                    # 未选中的保留
+                                    remaining_pairs.append(p)
                                 else:
-                                    st.warning("⚠️ 没有添加任何交易对")
+                                    # 检查是否成功添加（可能因为已存在而跳过）
+                                    exists = any(
+                                        cfg.get("chain") == p.get("chain") 
+                                        and cfg.get("pair_address") == p.get("pair_address")
+                                        for cfg in st.session_state["stable_configs"]
+                                    )
+                                    if not exists:
+                                        # 如果添加失败（可能因为已存在），也保留
+                                        remaining_pairs.append(p)
+                            
+                            # 更新缓存
+                            st.session_state["collected_pairs_cache"] = remaining_pairs
+                            save_collected_pairs_cache(remaining_pairs)
                             
                             # 显示错误信息（如果有）
                             if error_details:
@@ -4890,20 +4906,20 @@ def run_streamlit_panel():
                         border_color = "#2ecc71"
                         text_color = "#2ecc71"
                     
-                    # 自定义卡片，数字更小
+                    # 自定义卡片样式（优化字体大小）
                     st.markdown(f"""
                     <div style='background: {bg_color}; 
                                 border-left: 4px solid {border_color};
                                 padding: 10px;
                                 border-radius: 5px;
                                 margin-bottom: 10px;'>
-                        <div style='font-size: 12px; color: #666; margin-bottom: 5px;'>
+                        <div style='font-size: 15px; font-weight: 500; color: #333; margin-bottom: 6px;'>
                             {row['name']} ({row['chain']})
                         </div>
-                        <div style='font-size: 20px; font-weight: bold; color: {text_color};'>
+                        <div style='font-size: 14px; font-weight: bold; color: {text_color}; margin-bottom: 4px;'>
                             {row['deviation_pct']:+.3f}%
                         </div>
-                        <div style='font-size: 11px; color: #999; margin-top: 3px;'>
+                        <div style='font-size: 14px; color: #666;'>
                             ${row['price']:.4f} USD
                         </div>
                     </div>
