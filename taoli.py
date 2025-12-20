@@ -2688,17 +2688,41 @@ def add_send_log(msg_type: str, content: str, channels: list[str], success: bool
     logger.info(f"发送日志: {msg_type} - {channels} - {'成功' if success else '失败'}")
 
 
-def get_today_send_count() -> int:
-    """获取今天已发送的消息数量"""
+def get_today_send_count(channel: str | None = None) -> int:
+    """
+    获取今天已发送的消息数量
+    
+    参数:
+        channel: 如果指定，只统计该渠道的发送次数；如果为 None，只统计 Server酱 的发送次数
+    """
     logs = load_send_log()
     today = now_beijing().strftime("%Y-%m-%d")
-    count = sum(1 for log in logs if log.get("time", "").startswith(today) and log.get("success"))
+    count = 0
+    for log in logs:
+        if log.get("time", "").startswith(today) and log.get("success"):
+            channels = log.get("channels", [])
+            if channel:
+                # 统计指定渠道
+                if channel in channels:
+                    count += 1
+            else:
+                # 默认只统计 Server酱（因为只有 Server酱 有限制）
+                if "Server酱" in channels:
+                    count += 1
     return count
 
 
+def can_send_serverchan() -> bool:
+    """检查今天是否还能通过 Server酱 发送消息（Server酱每天限制5条）"""
+    return get_today_send_count("Server酱") < MAX_DAILY_SENDS
+
+
 def can_send_today() -> bool:
-    """检查今天是否还能发送消息"""
-    return get_today_send_count() < MAX_DAILY_SENDS
+    """
+    检查今天是否还能发送消息（兼容旧代码，实际只检查 Server酱）
+    注意：Telegram 和钉钉没有限制，可以随时发送
+    """
+    return can_send_serverchan()
 
 
 def should_send_heartbeat() -> bool:
@@ -2779,16 +2803,16 @@ def send_all_notifications(text: str, notify_cfg: dict | None = None, msg_type: 
     多渠道发送通知：Telegram / Server酱 / 钉钉。
     带额度管理和日志记录。
     
+    注意：
+    - Server酱：每天限制 5 条（免费版限制）
+    - Telegram：无限制，可随时发送
+    - 钉钉：无限制，可随时发送
+    
     参数:
         text: 通知内容
         notify_cfg: 通知配置（测试用）
         msg_type: 消息类型（用于日志）
     """
-    # 检查今日发送额度
-    if notify_cfg is None and not can_send_today():
-        logger.warning(f"今日发送额度已用完（{MAX_DAILY_SENDS}条），跳过发送")
-        return False
-    
     sent_channels = []
     success = False
     
@@ -2799,14 +2823,22 @@ def send_all_notifications(text: str, notify_cfg: dict | None = None, msg_type: 
         sc_key = notify_cfg.get("serverchan_sendkey") or DEFAULT_SERVERCHAN_SENDKEY
         dt_hook = notify_cfg.get("dingtalk_webhook") or DEFAULT_DINGTALK_WEBHOOK
 
+        # Telegram 无限制，直接发送
         if tg_token and tg_chat:
             if send_telegram(text, tg_token, tg_chat):
                 sent_channels.append("Telegram")
                 success = True
+        
+        # Server酱 需要检查额度
         if sc_key:
-            if send_serverchan(text, sc_key):
-                sent_channels.append("Server酱")
-                success = True
+            if can_send_serverchan():
+                if send_serverchan(text, sc_key):
+                    sent_channels.append("Server酱")
+                    success = True
+            else:
+                logger.warning(f"Server酱今日额度已用完（{MAX_DAILY_SENDS}条），跳过发送")
+        
+        # 钉钉 无限制，直接发送
         if dt_hook:
             if send_dingtalk(text, dt_hook):
                 sent_channels.append("钉钉")
@@ -2850,14 +2882,23 @@ def send_all_notifications(text: str, notify_cfg: dict | None = None, msg_type: 
             tg_chat = user.get("telegram_chat_id") or DEFAULT_TELEGRAM_CHAT_ID
             sc_key = user.get("serverchan_sendkey") or DEFAULT_SERVERCHAN_SENDKEY
             dt_hook = user.get("dingtalk_webhook") or DEFAULT_DINGTALK_WEBHOOK
+            
+            # Telegram 无限制，直接发送
             if tg_token and tg_chat:
                 if send_telegram(text, tg_token, tg_chat):
                     sent_channels.append("Telegram")
                     success = True
+            
+            # Server酱 需要检查额度（每个用户独立检查）
             if sc_key:
-                if send_serverchan(text, sc_key):
-                    sent_channels.append("Server酱")
-                    success = True
+                if can_send_serverchan():
+                    if send_serverchan(text, sc_key):
+                        sent_channels.append("Server酱")
+                        success = True
+                else:
+                    logger.debug(f"Server酱今日额度已用完（{MAX_DAILY_SENDS}条），跳过发送给用户 {user.get('name', '未知')}")
+            
+            # 钉钉 无限制，直接发送
             if dt_hook:
                 if send_dingtalk(text, dt_hook):
                     sent_channels.append("钉钉")
@@ -2947,33 +2988,30 @@ def run_cli_monitor_with_alerts():
                 key_nc = f"{name}_{chain}"
                 prev = last_alert_state.get(key_nc, False)
                 if is_alert and not prev:
-                    # 检查今日额度
-                    if can_send_today():
-                        # 使用 Coingecko 做一次全局 cross-check + 稳定币对交叉核对
-                        global_text = ""
-                        if symbol:
-                            cg_prices = get_coingecko_prices([symbol])
-                            cg_price = cg_prices.get(symbol)
-                            if cg_price:
-                                global_dev = (cg_price - 1.0) * 100
-                                global_text = (
-                                    f"\nCoingecko 全局参考: {symbol} ≈ {cg_price:.6f} USD "
-                                    f"(全局偏离 {global_dev:+.3f}%)."
-                                )
+                    # 注意：Telegram 和钉钉无限制，Server酱 有5条限制，但 send_all_notifications 会自动处理
+                    # 使用 Coingecko 做一次全局 cross-check + 稳定币对交叉核对
+                    global_text = ""
+                    if symbol:
+                        cg_prices = get_coingecko_prices([symbol])
+                        cg_price = cg_prices.get(symbol)
+                        if cg_price:
+                            global_dev = (cg_price - 1.0) * 100
+                            global_text = (
+                                f"\nCoingecko 全局参考: {symbol} ≈ {cg_price:.6f} USD "
+                                f"(全局偏离 {global_dev:+.3f}%)."
+                            )
 
-                        pair_text = build_pair_crosscheck_text(s)
+                    pair_text = build_pair_crosscheck_text(s)
 
-                        msg = (
-                            f"[稳定币脱锚告警]\n"
-                            f"{name} ({chain})\n"
-                            f"价格: {price:.6f} USD\n"
-                            f"偏离: {dev:+.3f}% (阈值 ±{threshold:.3f}%)"
-                            f"{global_text}{pair_text}"
-                        )
-                        send_all_notifications(msg, msg_type="脱锚告警")
-                        total_alerts += 1
-                    else:
-                        logger.warning(f"今日额度已用完，跳过脱锚告警: {name} ({chain})")
+                    msg = (
+                        f"[稳定币脱锚告警]\n"
+                        f"{name} ({chain})\n"
+                        f"价格: {price:.6f} USD\n"
+                        f"偏离: {dev:+.3f}% (阈值 ±{threshold:.3f}%)"
+                        f"{global_text}{pair_text}"
+                    )
+                    send_all_notifications(msg, msg_type="脱锚告警")
+                    total_alerts += 1
                 last_alert_state[key_nc] = is_alert
 
             # ========= 跨链套利机会扫描（使用优化参数）=========
@@ -3011,49 +3049,102 @@ def run_cli_monitor_with_alerts():
                     last_ts = last_arb_alerts.get(key, 0.0)
                     # 同一机会 5 分钟内只推一次
                     if now_ts - last_ts > 300:
-                        if can_send_today():
-                            msg = (
-                                "[跨链套利机会]\n"
-                                f"{name}\n"
-                                f"买入链: {cheap_chain}  价格: {opp['cheap_price']:.6f} USD\n"
-                                f"卖出链: {rich_chain}  价格: {opp['rich_price']:.6f} USD\n"
-                                f"理论价差: {cd['价差百分比']:+.3f}%\n"
-                                f"按资金规模 ${DEFAULT_TRADE_AMOUNT_USD:.0f} 估算：\n"
-                                f"预估净利润: ${cd['预估净利润']:.2f} "
-                                f"(净利率 {cd['预估净利润率']:+.3f}%)\n"
-                                f"成本明细: 源链Gas ${cd['Gas费（源链）']:.2f} / "
-                                f"目标链Gas ${cd['Gas费（目标链）']:.2f} / "
-                                f"跨链桥费 ${cd['跨链桥费']:.2f} / 滑点损失 ${cd['滑点损失']:.2f}"
-                            )
-                            send_all_notifications(msg, msg_type="套利机会")
-                            total_arb_opps += 1
-                            last_arb_alerts[key] = now_ts
-                        else:
-                            logger.warning(f"今日额度已用完，跳过套利提醒: {name} {cheap_chain}->{rich_chain}")
+                        # 注意：Telegram 和钉钉无限制，Server酱 有5条限制，但 send_all_notifications 会自动处理
+                        msg = (
+                            "[跨链套利机会]\n"
+                            f"{name}\n"
+                            f"买入链: {cheap_chain}  价格: {opp['cheap_price']:.6f} USD\n"
+                            f"卖出链: {rich_chain}  价格: {opp['rich_price']:.6f} USD\n"
+                            f"理论价差: {cd['价差百分比']:+.3f}%\n"
+                            f"按资金规模 ${DEFAULT_TRADE_AMOUNT_USD:.0f} 估算：\n"
+                            f"预估净利润: ${cd['预估净利润']:.2f} "
+                            f"(净利率 {cd['预估净利润率']:+.3f}%)\n"
+                            f"成本明细: 源链Gas ${cd['Gas费（源链）']:.2f} / "
+                            f"目标链Gas ${cd['Gas费（目标链）']:.2f} / "
+                            f"跨链桥费 ${cd['跨链桥费']:.2f} / 滑点损失 ${cd['滑点损失']:.2f}"
+                        )
+                        send_all_notifications(msg, msg_type="套利机会")
+                        total_arb_opps += 1
+                        last_arb_alerts[key] = now_ts
             else:
                 logger.info("\n当前未发现达到阈值的跨链套利机会")
 
             # ========= 心跳通知（每天 12:00 固定时间） =========
             if should_send_heartbeat():
-                if can_send_today():
-                    logger.info("⏰ 到达固定心跳时间 (12:00)，发送心跳通知...")
-                    hb_time = format_beijing()
-                    today_count = get_today_send_count()
-                    remaining = MAX_DAILY_SENDS - today_count
+                # 注意：Telegram 和钉钉无限制，Server酱 有5条限制，但 send_all_notifications 会自动处理
+                logger.info("⏰ 到达固定心跳时间 (12:00)，发送心跳通知...")
+                hb_time = format_beijing()
+                serverchan_count = get_today_send_count("Server酱")
+                serverchan_remaining = MAX_DAILY_SENDS - serverchan_count
+                    
+                    # 统计链的数量
+                    unique_chains = set(s.get("chain", "") for s in statuses if s.get("chain"))
+                    chain_count = len(unique_chains)
+                    
+                    # 统计稳定币的数量（按 symbol，如果没有则按 name）
+                    unique_symbols = set()
+                    for s in statuses:
+                        symbol = (s.get("symbol") or s.get("name") or "").upper()
+                        if symbol:
+                            unique_symbols.add(symbol)
+                    symbol_count = len(unique_symbols)
+                    
+                    # 生成监控清单（按稳定币分组，显示各链的价格）
+                    monitor_list = []
+                    from collections import defaultdict
+                    by_symbol = defaultdict(list)
+                    for s in statuses:
+                        symbol = (s.get("symbol") or s.get("name") or "").upper()
+                        if symbol:
+                            by_symbol[symbol].append(s)
+                    
+                    # 按稳定币名称排序
+                    for symbol in sorted(by_symbol.keys()):
+                        chains_info = []
+                        for s in sorted(by_symbol[symbol], key=lambda x: x.get("chain", "")):
+                            chain = s.get("chain", "未知")
+                            price = s.get("price", 0)
+                            dev = s.get("deviation_pct", 0)
+                            is_alert = s.get("is_alert", False)
+                            status_icon = "⚠️" if is_alert else "✅"
+                            chains_info.append(f"{chain}: ${price:.4f} ({dev:+.2f}%){status_icon}")
+                        if chains_info:
+                            # 如果链数量较多，换行显示；否则用逗号连接
+                            if len(chains_info) > 3:
+                                chains_text = "\n    " + ", ".join(chains_info)
+                            else:
+                                chains_text = " " + ", ".join(chains_info)
+                            monitor_list.append(f"  • {symbol}:{chains_text}")
+                    
+                    # 构建心跳消息
                     hb_msg = (
                         "[脱锚监控心跳 - 每日定时]\n"
                         f"⏰ 时间: {hb_time}\n"
-                        f"📊 当前监控稳定币池数量: {len(statuses)}\n"
+                        f"📊 监控统计:\n"
+                        f"  - 监控池数量: {len(statuses)} 个\n"
+                        f"  - 检测链数量: {chain_count} 条\n"
+                        f"  - 稳定币种类: {symbol_count} 种\n"
                         f"⚠️ 本次循环检测到的脱锚数量: "
                         f"{sum(1 for s in statuses if s['is_alert'])}\n"
                         f"📈 累计脱锚告警次数: {total_alerts}\n"
                         f"💰 累计跨链套利机会通知次数: {total_arb_opps}\n"
-                        f"📤 今日已发送: {today_count}/{MAX_DAILY_SENDS} 条，剩余: {remaining} 条"
+                        f"📤 Server酱额度: {serverchan_count}/{MAX_DAILY_SENDS} 条，剩余: {serverchan_remaining} 条\n"
+                        f"💡 提示: Telegram 和钉钉无限制，可随时发送\n"
+                        f"\n📋 监控清单:\n"
                     )
-                    send_all_notifications(hb_msg, msg_type="心跳")
-                    logger.info("✅ 心跳发送成功")
-                else:
-                    logger.warning(f"⚠️ 今日发送额度已用完({MAX_DAILY_SENDS}条)，跳过心跳")
+                    
+                    # 添加清单（如果清单太长，只显示前20个，避免消息过长）
+                    if monitor_list:
+                        if len(monitor_list) > 20:
+                            hb_msg += "\n".join(monitor_list[:20])
+                            hb_msg += f"\n  ... 还有 {len(monitor_list) - 20} 个监控项（已省略）"
+                        else:
+                            hb_msg += "\n".join(monitor_list)
+                    else:
+                        hb_msg += "  （暂无监控项）"
+                    
+                send_all_notifications(hb_msg, msg_type="心跳")
+                logger.info("✅ 心跳发送成功（Telegram 和钉钉已发送，Server酱 根据额度自动处理）")
 
             # ========= 控制循环频率 =========
             elapsed = time.time() - loop_start
@@ -4941,18 +5032,19 @@ def run_streamlit_panel():
     st.markdown("---")
     st.subheader("📤 发送日志")
     
-    # 显示今日发送统计
-    today_count = get_today_send_count()
-    remaining = MAX_DAILY_SENDS - today_count
+    # 显示今日发送统计（只统计 Server酱，因为只有 Server酱 有限制）
+    serverchan_count = get_today_send_count("Server酱")
+    serverchan_remaining = MAX_DAILY_SENDS - serverchan_count
     
     col_stat1, col_stat2, col_stat3 = st.columns(3)
-    col_stat1.metric("今日已发送", f"{today_count} 条")
-    col_stat2.metric("剩余额度", f"{remaining} 条")
-    col_stat3.metric("每日限额", f"{MAX_DAILY_SENDS} 条")
+    col_stat1.metric("Server酱已发送", f"{serverchan_count} 条")
+    col_stat2.metric("Server酱剩余", f"{serverchan_remaining} 条")
+    col_stat3.metric("Server酱限额", f"{MAX_DAILY_SENDS} 条/天")
     
     st.caption(f"💡 心跳: 每天{HEARTBEAT_PER_DAY}次（{HEARTBEAT_INTERVAL/3600:.1f}小时间隔）")
-    st.caption(f"⚡ 套利专用额度: {ARBITRAGE_QUOTA}条/天")
+    st.caption(f"⚡ 套利专用额度: {ARBITRAGE_QUOTA}条/天（仅 Server酱）")
     st.caption("📌 策略: 套利优先，心跳避让，确保不错过赚钱机会")
+    st.info("ℹ️ **重要提示**: Server酱每天限制 5 条；Telegram 和钉钉无限制，可随时发送")
     
     # 显示发送日志列表
     logs = load_send_log()
