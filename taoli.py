@@ -1289,6 +1289,7 @@ def search_stablecoin_pairs(
     chains: list[str] | None = None,
     min_liquidity_usd: float = 10000.0,
     max_results_per_chain: int = 5,
+    all_stable_symbols: list[str] | None = None,
 ) -> list[dict]:
     """
     使用 DexScreener API 自动搜索稳定币交易对。
@@ -1298,6 +1299,7 @@ def search_stablecoin_pairs(
         chains: 要搜索的链列表，如果为 None 则搜索所有支持的链
         min_liquidity_usd: 最小流动性要求（USD）
         max_results_per_chain: 每条链最多返回的结果数
+        all_stable_symbols: 所有要搜索的稳定币列表，如果为 None 则使用默认的主流稳定币
     
     返回:
         交易对列表，每项包含：
@@ -1315,22 +1317,24 @@ def search_stablecoin_pairs(
     
     results: list[dict] = []
     
+    # 确定要搜索的稳定币列表
+    if all_stable_symbols is None:
+        # 默认使用主流稳定币（向后兼容）
+        target_symbols = ["USDT", "USDC", "DAI", "BUSD", "USDD", "TUSD", "USDP"]
+    else:
+        # 使用传入的所有稳定币列表，但排除自己（避免搜索 A/A）
+        target_symbols = [s.upper() for s in all_stable_symbols if s.upper() != stable_symbol.upper()]
+    
     # 方法1: 使用搜索 API 搜索稳定币交易对
     # 搜索格式: "USDT/USDC", "USDT/DAI" 等
-    search_queries = [
-        f"{stable_symbol}/USDT",
-        f"{stable_symbol}/USDC",
-        f"{stable_symbol}/DAI",
-        f"{stable_symbol}/BUSD",
-        f"{stable_symbol}/USDD",
-        f"{stable_symbol}/TUSD",
-        f"{stable_symbol}/USDP",
-        f"USDT/{stable_symbol}",
-        f"USDC/{stable_symbol}",
-        f"DAI/{stable_symbol}",
-    ]
+    # 搜索与所有目标稳定币的组合（双向搜索）
+    search_queries = []
+    for target_symbol in target_symbols:
+        # 双向搜索：A/B 和 B/A（DexScreener 可能返回不同结果）
+        search_queries.append(f"{stable_symbol}/{target_symbol}")
+        search_queries.append(f"{target_symbol}/{stable_symbol}")
     
-    # 去重，避免重复搜索
+    # 去重，避免重复搜索（例如 USDT/USDC 和 USDC/USDT 可能重复）
     search_queries = list(set(search_queries))
     
     for query_idx, query in enumerate(search_queries, 1):
@@ -1500,6 +1504,7 @@ def auto_collect_stablecoin_pairs(
                 chains=chains,
                 min_liquidity_usd=min_liquidity_usd,
                 max_results_per_chain=max_results_per_symbol,
+                all_stable_symbols=stable_symbols,  # 传入所有要搜索的稳定币列表
             )
             all_results.extend(pairs)
             logger.info(f"[自动采集] {symbol} 找到 {len(pairs)} 个交易对")
@@ -3076,73 +3081,73 @@ def run_cli_monitor_with_alerts():
                 hb_time = format_beijing()
                 serverchan_count = get_today_send_count("Server酱")
                 serverchan_remaining = MAX_DAILY_SENDS - serverchan_count
-                    
-                    # 统计链的数量
-                    unique_chains = set(s.get("chain", "") for s in statuses if s.get("chain"))
-                    chain_count = len(unique_chains)
-                    
-                    # 统计稳定币的数量（按 symbol，如果没有则按 name）
-                    unique_symbols = set()
-                    for s in statuses:
-                        symbol = (s.get("symbol") or s.get("name") or "").upper()
-                        if symbol:
-                            unique_symbols.add(symbol)
-                    symbol_count = len(unique_symbols)
-                    
-                    # 生成监控清单（按稳定币分组，显示各链的价格）
-                    monitor_list = []
-                    from collections import defaultdict
-                    by_symbol = defaultdict(list)
-                    for s in statuses:
-                        symbol = (s.get("symbol") or s.get("name") or "").upper()
-                        if symbol:
-                            by_symbol[symbol].append(s)
-                    
-                    # 按稳定币名称排序
-                    for symbol in sorted(by_symbol.keys()):
-                        chains_info = []
-                        for s in sorted(by_symbol[symbol], key=lambda x: x.get("chain", "")):
-                            chain = s.get("chain", "未知")
-                            price = s.get("price", 0)
-                            dev = s.get("deviation_pct", 0)
-                            is_alert = s.get("is_alert", False)
-                            status_icon = "⚠️" if is_alert else "✅"
-                            chains_info.append(f"{chain}: ${price:.4f} ({dev:+.2f}%){status_icon}")
-                        if chains_info:
-                            # 如果链数量较多，换行显示；否则用逗号连接
-                            if len(chains_info) > 3:
-                                chains_text = "\n    " + ", ".join(chains_info)
-                            else:
-                                chains_text = " " + ", ".join(chains_info)
-                            monitor_list.append(f"  • {symbol}:{chains_text}")
-                    
-                    # 构建心跳消息
-                    hb_msg = (
-                        "[脱锚监控心跳 - 每日定时]\n"
-                        f"⏰ 时间: {hb_time}\n"
-                        f"📊 监控统计:\n"
-                        f"  - 监控池数量: {len(statuses)} 个\n"
-                        f"  - 检测链数量: {chain_count} 条\n"
-                        f"  - 稳定币种类: {symbol_count} 种\n"
-                        f"⚠️ 本次循环检测到的脱锚数量: "
-                        f"{sum(1 for s in statuses if s['is_alert'])}\n"
-                        f"📈 累计脱锚告警次数: {total_alerts}\n"
-                        f"💰 累计跨链套利机会通知次数: {total_arb_opps}\n"
-                        f"📤 Server酱额度: {serverchan_count}/{MAX_DAILY_SENDS} 条，剩余: {serverchan_remaining} 条\n"
-                        f"💡 提示: Telegram 和钉钉无限制，可随时发送\n"
-                        f"\n📋 监控清单:\n"
-                    )
-                    
-                    # 添加清单（如果清单太长，只显示前20个，避免消息过长）
-                    if monitor_list:
-                        if len(monitor_list) > 20:
-                            hb_msg += "\n".join(monitor_list[:20])
-                            hb_msg += f"\n  ... 还有 {len(monitor_list) - 20} 个监控项（已省略）"
+                
+                # 统计链的数量
+                unique_chains = set(s.get("chain", "") for s in statuses if s.get("chain"))
+                chain_count = len(unique_chains)
+                
+                # 统计稳定币的数量（按 symbol，如果没有则按 name）
+                unique_symbols = set()
+                for s in statuses:
+                    symbol = (s.get("symbol") or s.get("name") or "").upper()
+                    if symbol:
+                        unique_symbols.add(symbol)
+                symbol_count = len(unique_symbols)
+                
+                # 生成监控清单（按稳定币分组，显示各链的价格）
+                monitor_list = []
+                from collections import defaultdict
+                by_symbol = defaultdict(list)
+                for s in statuses:
+                    symbol = (s.get("symbol") or s.get("name") or "").upper()
+                    if symbol:
+                        by_symbol[symbol].append(s)
+                
+                # 按稳定币名称排序
+                for symbol in sorted(by_symbol.keys()):
+                    chains_info = []
+                    for s in sorted(by_symbol[symbol], key=lambda x: x.get("chain", "")):
+                        chain = s.get("chain", "未知")
+                        price = s.get("price", 0)
+                        dev = s.get("deviation_pct", 0)
+                        is_alert = s.get("is_alert", False)
+                        status_icon = "⚠️" if is_alert else "✅"
+                        chains_info.append(f"{chain}: ${price:.4f} ({dev:+.2f}%){status_icon}")
+                    if chains_info:
+                        # 如果链数量较多，换行显示；否则用逗号连接
+                        if len(chains_info) > 3:
+                            chains_text = "\n    " + ", ".join(chains_info)
                         else:
-                            hb_msg += "\n".join(monitor_list)
+                            chains_text = " " + ", ".join(chains_info)
+                        monitor_list.append(f"  • {symbol}:{chains_text}")
+                
+                # 构建心跳消息
+                hb_msg = (
+                    "[脱锚监控心跳 - 每日定时]\n"
+                    f"⏰ 时间: {hb_time}\n"
+                    f"📊 监控统计:\n"
+                    f"  - 监控池数量: {len(statuses)} 个\n"
+                    f"  - 检测链数量: {chain_count} 条\n"
+                    f"  - 稳定币种类: {symbol_count} 种\n"
+                    f"⚠️ 本次循环检测到的脱锚数量: "
+                    f"{sum(1 for s in statuses if s['is_alert'])}\n"
+                    f"📈 累计脱锚告警次数: {total_alerts}\n"
+                    f"💰 累计跨链套利机会通知次数: {total_arb_opps}\n"
+                    f"📤 Server酱额度: {serverchan_count}/{MAX_DAILY_SENDS} 条，剩余: {serverchan_remaining} 条\n"
+                    f"💡 提示: Telegram 和钉钉无限制，可随时发送\n"
+                    f"\n📋 监控清单:\n"
+                )
+                
+                # 添加清单（如果清单太长，只显示前20个，避免消息过长）
+                if monitor_list:
+                    if len(monitor_list) > 20:
+                        hb_msg += "\n".join(monitor_list[:20])
+                        hb_msg += f"\n  ... 还有 {len(monitor_list) - 20} 个监控项（已省略）"
                     else:
-                        hb_msg += "  （暂无监控项）"
-                    
+                        hb_msg += "\n".join(monitor_list)
+                else:
+                    hb_msg += "  （暂无监控项）"
+                
                 send_all_notifications(hb_msg, msg_type="心跳")
                 logger.info("✅ 心跳发送成功（Telegram 和钉钉已发送，Server酱 根据额度自动处理）")
 
