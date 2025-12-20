@@ -3221,30 +3221,35 @@ def run_streamlit_panel():
             st.session_state["available_chains"] = list(CHAIN_NAME_TO_ID.keys())
         
         # 从 API 获取支持的链列表（可选，用于获取最新的链）
-        if st.button("🔄 刷新链列表", help="从 DexScreener API 获取最新支持的链列表（可能发现更多新链）"):
-            with st.spinner("正在从 API 获取支持的链列表..."):
-                try:
-                    chains = get_available_chains_from_api()
-                    st.session_state["available_chains"] = chains
-                    st.success(f"已获取 {len(chains)} 条链")
-                except Exception as e:
-                    st.error(f"获取链列表失败: {e}")
-                    # 失败时保持当前链列表不变
+        with st.expander("⚙️ 链列表管理", expanded=False):
+            col_refresh, col_info = st.columns([1, 2])
+            with col_refresh:
+                if st.button("🔄 刷新链列表", use_container_width=True, help="从 DexScreener API 获取最新支持的链列表"):
+                    with st.spinner("正在从 API 获取支持的链列表..."):
+                        try:
+                            chains = get_available_chains_from_api()
+                            st.session_state["available_chains"] = chains
+                            st.success(f"✅ 已获取 {len(chains)} 条链")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ 获取链列表失败: {e}")
+            with col_info:
+                st.caption(f"当前可用链数: **{len(st.session_state['available_chains'])}** 条")
         
         # 获取所有稳定币符号（包括自定义）
         all_stable_symbols = get_all_stable_symbols()
         
         # 自定义稳定币管理
-        with st.expander("➕ 添加自定义稳定币"):
+        with st.expander("➕ 自定义稳定币管理", expanded=False):
             new_symbol = st.text_input(
                 "稳定币符号（如：USD0, FRAX 等）",
                 value="",
                 key="new_custom_symbol",
                 help="输入稳定币符号，会自动转换为大写",
             )
-            col_add1, col_add2 = st.columns([1, 1])
+            col_add1, col_add2, col_add3 = st.columns([1, 1, 1])
             with col_add1:
-                if st.button("添加", key="add_custom_symbol"):
+                if st.button("➕ 添加", key="add_custom_symbol", use_container_width=True):
                     if new_symbol:
                         symbol_upper = new_symbol.upper().strip()
                         if symbol_upper:
@@ -3252,95 +3257,91 @@ def run_streamlit_panel():
                             if symbol_upper not in custom_symbols:
                                 custom_symbols.append(symbol_upper)
                                 save_custom_stable_symbols(custom_symbols)
-                                st.success(f"已添加稳定币: {symbol_upper}")
+                                st.success(f"✅ 已添加: {symbol_upper}")
                                 st.rerun()
                             else:
-                                st.warning(f"稳定币 {symbol_upper} 已存在")
+                                st.warning(f"⚠️ {symbol_upper} 已存在")
                         else:
-                            st.warning("请输入有效的稳定币符号")
+                            st.warning("⚠️ 请输入有效的稳定币符号")
             with col_add2:
-                if st.button("查看已添加的自定义稳定币", key="view_custom_symbols"):
+                if st.button("📋 查看列表", key="view_custom_symbols", use_container_width=True):
                     custom_symbols = load_custom_stable_symbols()
                     if custom_symbols:
-                        st.write("已添加的自定义稳定币：", ", ".join(custom_symbols))
+                        st.info("已添加的自定义稳定币: " + ", ".join(custom_symbols))
                     else:
                         st.info("暂无自定义稳定币")
+            with col_add3:
+                # 显示自定义稳定币数量
+                custom_count = len(load_custom_stable_symbols())
+                st.caption(f"自定义数量: **{custom_count}**")
         
-        col_auto1, col_auto2, col_auto3 = st.columns(3)
+        # 初始化选择状态（优化：统一使用 widget key 作为状态变量，避免冲突）
+        if "auto_symbols_multiselect" not in st.session_state:
+            # 默认选择主流稳定币（不超过5个，避免侧边栏过长）
+            default_symbols = ["USDT", "USDC", "DAI"]
+            st.session_state["auto_symbols_multiselect"] = [s for s in default_symbols if s in all_stable_symbols]
         
-        # 初始化选择状态
-        if "auto_symbols_selected" not in st.session_state:
-            st.session_state["auto_symbols_selected"] = ["USDT", "USDC"] if "USDT" in all_stable_symbols and "USDC" in all_stable_symbols else []
-        if "auto_chains_selected" not in st.session_state:
-            # 默认选择所有 API 返回的链（不硬编码）
-            st.session_state["auto_chains_selected"] = st.session_state["available_chains"]
+        if "auto_chains_multiselect" not in st.session_state:
+            # 默认选择主流链（不超过8个）
+            main_chains = ["ethereum", "bsc", "polygon", "arbitrum", "optimism", "base", "avalanche", "zksync"]
+            available = st.session_state["available_chains"]
+            st.session_state["auto_chains_multiselect"] = [c for c in main_chains if c in available][:8]
         
-        # 稳定币选择器（带全选功能）
-        with col_auto1:
-            st.markdown("**选择要采集的稳定币**")
-            col_symbols1, col_symbols2 = st.columns([3, 1])
-            with col_symbols2:
-                # 先处理按钮，避免 multiselect 状态覆盖
-                if st.button("全选", key="select_all_symbols", use_container_width=True):
-                    # 直接修改 multiselect 的 key 对应的值
-                    st.session_state["auto_symbols_multiselect"] = list(all_stable_symbols)
-                    st.session_state["auto_symbols_selected"] = list(all_stable_symbols)
-                    st.rerun()
-                if st.button("清空", key="clear_all_symbols", use_container_width=True):
-                    # 直接修改 multiselect 的 key 对应的值
-                    st.session_state["auto_symbols_multiselect"] = []
-                    st.session_state["auto_symbols_selected"] = []
-                    st.rerun()
-            with col_symbols1:
-                auto_symbols = st.multiselect(
-                    "稳定币（可多选）",
-                    options=all_stable_symbols,
-                    default=st.session_state.get("auto_symbols_selected", []),
-                    help="选择要自动搜索的稳定币符号",
-                    label_visibility="collapsed",
-                    key="auto_symbols_multiselect",
-                )
-                # 更新 session state
-                st.session_state["auto_symbols_selected"] = auto_symbols
+        # 稳定币选择器（优化布局和交互）
+        st.markdown("**📊 选择要采集的稳定币**")
+        col_symbols_btn1, col_symbols_btn2, col_symbols_btn3 = st.columns([1, 1, 2])
+        with col_symbols_btn1:
+            if st.button("✅ 全选稳定币", key="select_all_symbols", use_container_width=True):
+                st.session_state["auto_symbols_multiselect"] = list(all_stable_symbols)
+                st.rerun()
+        with col_symbols_btn2:
+            if st.button("❌ 清空稳定币", key="clear_all_symbols", use_container_width=True):
+                st.session_state["auto_symbols_multiselect"] = []
+                st.rerun()
+        with col_symbols_btn3:
+            selected_count = len(st.session_state.get("auto_symbols_multiselect", []))
+            st.caption(f"已选择: **{selected_count}** / {len(all_stable_symbols)} 个稳定币")
         
-        # 链选择器（带全选功能）
-        with col_auto2:
-            st.markdown("**选择要搜索的链**")
-            col_chains1, col_chains2 = st.columns([3, 1])
-            with col_chains2:
-                # 先处理按钮，避免 multiselect 状态覆盖
-                if st.button("全选", key="select_all_chains", use_container_width=True):
-                    # 直接修改 multiselect 的 key 对应的值
-                    st.session_state["auto_chains_multiselect"] = list(st.session_state["available_chains"])
-                    st.session_state["auto_chains_selected"] = list(st.session_state["available_chains"])
-                    st.rerun()
-                if st.button("清空", key="clear_all_chains", use_container_width=True):
-                    # 直接修改 multiselect 的 key 对应的值
-                    st.session_state["auto_chains_multiselect"] = []
-                    st.session_state["auto_chains_selected"] = []
-                    st.rerun()
-            with col_chains1:
-                auto_chains = st.multiselect(
-                    "链（可多选）",
-                    options=st.session_state["available_chains"],
-                    default=st.session_state.get("auto_chains_selected", []),
-                    help="选择要在哪些链上搜索（链列表从 API 动态获取）",
-                    label_visibility="collapsed",
-                    key="auto_chains_multiselect",
-                )
-                # 更新 session state
-                st.session_state["auto_chains_selected"] = auto_chains
+        # 注意：使用 key 时，不要同时使用 default 参数，widget 会自动从 session_state[key] 读取值
+        auto_symbols = st.multiselect(
+            "稳定币（可多选，支持搜索）",
+            options=all_stable_symbols,
+            help="💡 在输入框中输入关键词可快速搜索稳定币",
+            key="auto_symbols_multiselect",
+        )
         
-        # 最小流动性（默认 100 万美金）
-        with col_auto3:
-            auto_min_liq = st.number_input(
-                "最小流动性（USD）",
-                min_value=0.0,
-                max_value=10_000_000.0,
-                value=1_000_000.0,  # 默认 100 万美金
-                step=10000.0,
-                help="只添加流动性大于此值的交易对（默认 100 万美金）",
-            )
+        # 链选择器（优化布局和交互）
+        st.markdown("**⛓️ 选择要搜索的链**")
+        col_chains_btn1, col_chains_btn2, col_chains_btn3 = st.columns([1, 1, 2])
+        with col_chains_btn1:
+            if st.button("✅ 全选链", key="select_all_chains", use_container_width=True):
+                st.session_state["auto_chains_multiselect"] = list(st.session_state["available_chains"])
+                st.rerun()
+        with col_chains_btn2:
+            if st.button("❌ 清空链", key="clear_all_chains", use_container_width=True):
+                st.session_state["auto_chains_multiselect"] = []
+                st.rerun()
+        with col_chains_btn3:
+            selected_chains_count = len(st.session_state.get("auto_chains_multiselect", []))
+            st.caption(f"已选择: **{selected_chains_count}** / {len(st.session_state['available_chains'])} 条链")
+        
+        # 注意：使用 key 时，不要同时使用 default 参数，widget 会自动从 session_state[key] 读取值
+        auto_chains = st.multiselect(
+            "链（可多选，支持搜索）",
+            options=st.session_state["available_chains"],
+            help="💡 在输入框中输入关键词可快速搜索链名",
+            key="auto_chains_multiselect",
+        )
+        
+        # 最小流动性（默认 50 万美金，更合理）
+        auto_min_liq = st.number_input(
+            "💰 最小流动性（USD）",
+            min_value=0.0,
+            max_value=10_000_000.0,
+            value=500_000.0,  # 默认 50 万美金（降低门槛）
+            step=10000.0,
+            help="💡 只添加流动性大于此值的交易对（建议: 50万-100万 USD）",
+        )
         
         if st.button("🚀 开始自动采集", type="primary", use_container_width=True):
             if not auto_symbols:
@@ -3378,124 +3379,244 @@ def run_streamlit_panel():
                         import traceback
                         st.code(traceback.format_exc())
         
-        # 显示采集结果，支持多选勾选
+        # 显示采集结果，支持多选勾选（优化：使用表格显示，性能更好）
         if st.session_state["collected_pairs_cache"]:
             collected_pairs = st.session_state["collected_pairs_cache"]
             
             st.markdown("---")
-            st.markdown("### 📋 采集结果（请勾选要添加的交易对）")
+            st.markdown("### 📋 采集结果")
             
-            # 初始化选中状态
+            # 初始化选中状态（使用列表而不是 set，便于保持顺序）
             if "selected_pair_indices" not in st.session_state:
-                st.session_state["selected_pair_indices"] = set()
+                st.session_state["selected_pair_indices"] = []
             
-            # 全选/全不选按钮
-            col_select_all, col_select_none, col_select_info = st.columns([1, 1, 2])
+            # 全选/全不选按钮（优化：减少不必要的 rerun）
+            col_select_all, col_select_none, col_select_info, col_select_filter = st.columns([1, 1, 2, 1])
             with col_select_all:
-                if st.button("✅ 全选", use_container_width=True):
-                    st.session_state["selected_pair_indices"] = set(range(len(collected_pairs)))
+                if st.button("✅ 全选", key="select_all_pairs", use_container_width=True):
+                    # 只选择未存在且非危险的交易对
+                    safe_indices = []
+                    for idx, p in enumerate(collected_pairs):
+                        exists = any(
+                            cfg.get("chain") == p["chain"] 
+                            and cfg.get("pair_address") == p["pair_address"]
+                            for cfg in st.session_state["stable_configs"]
+                        )
+                        risk_level = p.get("legitimacy", {}).get("risk_level", "safe")
+                        if not exists and risk_level != "danger":
+                            safe_indices.append(idx)
+                    st.session_state["selected_pair_indices"] = safe_indices
                     st.rerun()
             with col_select_none:
-                if st.button("❌ 全不选", use_container_width=True):
-                    st.session_state["selected_pair_indices"] = set()
+                if st.button("❌ 全不选", key="select_none_pairs", use_container_width=True):
+                    st.session_state["selected_pair_indices"] = []
                     st.rerun()
             with col_select_info:
                 selected_count = len(st.session_state["selected_pair_indices"])
-                st.markdown(f"**已选择: {selected_count} / {len(collected_pairs)} 个交易对**")
+                st.info(f"✅ 已选择: **{selected_count}** / {len(collected_pairs)} 个交易对")
+            with col_select_filter:
+                # 过滤选项
+                filter_option = st.selectbox(
+                    "筛选",
+                    options=["全部", "仅安全", "仅存在", "仅危险"],
+                    key="pair_filter",
+                    label_visibility="collapsed",
+                )
             
-            # 使用复选框列表显示每个交易对
-            st.markdown("#### 交易对列表：")
-            
-            # 创建表格显示，每行一个复选框
+            # 根据筛选条件过滤交易对
+            filtered_pairs = []
             for idx, p in enumerate(collected_pairs):
-                base_sym = p["base_token"]["symbol"]
-                quote_sym = p["quote_token"]["symbol"]
-                pair_name = f"{base_sym}/{quote_sym}"
-                
-                # 检查是否已存在于配置中
                 exists = any(
                     cfg.get("chain") == p["chain"] 
                     and cfg.get("pair_address") == p["pair_address"]
                     for cfg in st.session_state["stable_configs"]
                 )
-                exists_marker = " ⚠️已存在" if exists else ""
+                risk_level = p.get("legitimacy", {}).get("risk_level", "safe")
                 
-                # 🛡️ 获取风险等级
-                legitimacy = p.get("legitimacy", {})
-                risk_level = legitimacy.get("risk_level", "safe")
-                warnings = legitimacy.get("warnings", [])
+                if filter_option == "仅安全" and (exists or risk_level != "safe"):
+                    continue
+                elif filter_option == "仅存在" and not exists:
+                    continue
+                elif filter_option == "仅危险" and risk_level != "danger":
+                    continue
                 
-                # 风险标记
-                risk_icons = {
-                    "safe": "✅",
-                    "warning": "⚠️",
-                    "danger": "🚨"
-                }
-                risk_icon = risk_icons.get(risk_level, "")
-                
-                # 使用列布局：复选框 + 信息
-                col_cb, col_info1, col_info2, col_info3, col_info4 = st.columns([0.5, 2, 1.5, 1.5, 2])
-                
-                with col_cb:
-                    is_checked = idx in st.session_state["selected_pair_indices"]
-                    # 危险级别的禁用勾选
-                    if st.checkbox(
-                        "",
-                        value=is_checked,
-                        key=f"pair_checkbox_{idx}",
-                        disabled=exists or risk_level == "danger",
-                    ):
-                        st.session_state["selected_pair_indices"].add(idx)
-                    else:
-                        st.session_state["selected_pair_indices"].discard(idx)
-                
-                with col_info1:
-                    st.markdown(f"{risk_icon} **{pair_name}**{exists_marker}")
-                    # 显示警告信息
-                    if warnings:
-                        for warning in warnings[:2]:  # 最多显示2条
-                            st.caption(warning)
-                
-                with col_info2:
-                    st.markdown(f"链: `{p['chain']}`")
-                
-                with col_info3:
-                    st.markdown(f"流动性: `${p['liquidity_usd']:,.0f}`")
-                
-                with col_info4:
-                    price_str = f"{p['price_usd']:.6f}" if p.get('price_usd') else "N/A"
-                    st.markdown(f"价格: `{price_str}`")
-                    st.caption(f"地址: `{p['pair_address'][:10]}...`")
+                filtered_pairs.append((idx, p, exists, risk_level))
             
-            # 显示选中交易对的汇总
+            if not filtered_pairs:
+                st.warning("📭 没有符合条件的交易对")
+            else:
+                # 使用数据表格显示（性能更好，支持排序）
+                display_data = []
+                for idx, p, exists, risk_level in filtered_pairs:
+                    base_sym = p["base_token"]["symbol"]
+                    quote_sym = p["quote_token"]["symbol"]
+                    pair_name = f"{base_sym}/{quote_sym}"
+                    
+                    # 风险标记
+                    risk_icons = {"safe": "✅", "warning": "⚠️", "danger": "🚨"}
+                    risk_icon = risk_icons.get(risk_level, "")
+                    status = risk_icon + (" ⚠️已存在" if exists else "")
+                    
+                    is_selected = idx in st.session_state["selected_pair_indices"]
+                    selectable = not exists and risk_level != "danger"
+                    
+                    display_data.append({
+                        "选择": "✅" if is_selected else "⬜",
+                        "状态": status,
+                        "交易对": pair_name,
+                        "链": p['chain'],
+                        "流动性(USD)": f"${p['liquidity_usd']:,.0f}",
+                        "价格(USD)": f"{p['price_usd']:.6f}" if p.get('price_usd') else "N/A",
+                        "地址": p['pair_address'][:10] + "...",
+                        "_idx": idx,
+                        "_selectable": selectable,
+                    })
+                
+                # 显示表格
+                df_display = pd.DataFrame(display_data)
+                st.dataframe(
+                    df_display[["选择", "状态", "交易对", "链", "流动性(USD)", "价格(USD)"]],
+                    use_container_width=True,
+                    height=min(400, len(filtered_pairs) * 35 + 50),  # 自适应高度
+                    hide_index=True,
+                )
+                
+                # 使用复选框批量选择（优化：减少复选框数量，提升性能）
+                st.markdown("**💡 快速选择（推荐）：**")
+                col_batch1, col_batch2, col_batch3 = st.columns(3)
+                
+                with col_batch1:
+                    if st.button("✅ 选择所有安全项", key="select_all_safe", use_container_width=True):
+                        safe_indices = [idx for idx, _, exists, risk in filtered_pairs 
+                                       if not exists and risk == "safe"]
+                        current = set(st.session_state["selected_pair_indices"])
+                        current.update(safe_indices)
+                        st.session_state["selected_pair_indices"] = sorted(list(current))
+                        st.rerun()
+                
+                with col_batch2:
+                    if st.button("✅ 选择高流动性项（>100万）", key="select_high_liq", use_container_width=True):
+                        high_liq_indices = [idx for idx, p, exists, risk in filtered_pairs 
+                                           if not exists and risk != "danger" and p['liquidity_usd'] > 1_000_000]
+                        current = set(st.session_state["selected_pair_indices"])
+                        current.update(high_liq_indices)
+                        st.session_state["selected_pair_indices"] = sorted(list(current))
+                        st.rerun()
+                
+                with col_batch3:
+                    if st.button("❌ 取消全部选择", key="clear_selected_pairs", use_container_width=True):
+                        st.session_state["selected_pair_indices"] = []
+                        st.rerun()
+                
+                # 如果需要，也可以展开显示详细复选框（可折叠，默认收起）
+                with st.expander("🔽 展开详细选择（逐个勾选）", expanded=False):
+                    # 限制显示数量，避免页面卡顿
+                    max_display = 50
+                    pairs_to_show = filtered_pairs[:max_display]
+                    
+                    if len(filtered_pairs) > max_display:
+                        st.warning(f"⚠️ 仅显示前 {max_display} 个交易对（共 {len(filtered_pairs)} 个），请使用批量选择功能")
+                    
+                    for idx, p, exists, risk_level in pairs_to_show:
+                        base_sym = p["base_token"]["symbol"]
+                        quote_sym = p["quote_token"]["symbol"]
+                        pair_name = f"{base_sym}/{quote_sym}"
+                        
+                        is_checked = idx in st.session_state["selected_pair_indices"]
+                        selectable = not exists and risk_level != "danger"
+                        
+                        risk_icons = {"safe": "✅", "warning": "⚠️", "danger": "🚨"}
+                        risk_icon = risk_icons.get(risk_level, "")
+                        
+                        col_cb, col_info = st.columns([0.3, 9.7])
+                        with col_cb:
+                            checkbox_key = f"pair_checkbox_detailed_{idx}"
+                            new_checked = st.checkbox(
+                                "",
+                                value=is_checked,
+                                key=checkbox_key,
+                                disabled=not selectable,
+                                label_visibility="collapsed",
+                            )
+                            # 更新选中状态
+                            if new_checked and idx not in st.session_state["selected_pair_indices"]:
+                                st.session_state["selected_pair_indices"].append(idx)
+                            elif not new_checked and idx in st.session_state["selected_pair_indices"]:
+                                st.session_state["selected_pair_indices"].remove(idx)
+                        
+                        with col_info:
+                            exists_text = " ⚠️已存在" if exists else ""
+                            disabled_text = " 🚨已禁用" if not selectable else ""
+                            st.markdown(
+                                f"{risk_icon} **{pair_name}**{exists_text}{disabled_text} | "
+                                f"链: `{p['chain']}` | 流动性: `${p['liquidity_usd']:,.0f}` | "
+                                f"价格: `{p['price_usd']:.6f}`" if p.get('price_usd') else f"价格: N/A"
+                            )
+            
+            # 显示选中交易对的汇总（优化：更清晰的操作流程）
             selected_indices = st.session_state["selected_pair_indices"]
             if selected_indices:
                 st.markdown("---")
-                st.markdown(f"### ✅ 已选择 {len(selected_indices)} 个交易对")
                 
-                # 显示选中交易对的详细信息表格
-                selected_display = []
+                # 统计信息
+                col_sum1, col_sum2, col_sum3 = st.columns(3)
+                with col_sum1:
+                    st.metric("已选择", f"{len(selected_indices)} 个")
+                
+                # 检查有多少会跳过（已存在）
+                skipped_preview = 0
                 for idx in selected_indices:
                     p = collected_pairs[idx]
-                    base_sym = p["base_token"]["symbol"]
-                    quote_sym = p["quote_token"]["symbol"]
-                    selected_display.append({
-                        "交易对": f"{base_sym}/{quote_sym}",
-                        "链": p["chain"],
-                        "流动性(USD)": f"${p['liquidity_usd']:,.0f}",
-                        "价格(USD)": f"{p['price_usd']:.6f}" if p.get('price_usd') else "N/A",
-                        "Pair地址": p["pair_address"],
-                    })
+                    exists = any(
+                        cfg.get("chain") == p["chain"] 
+                        and cfg.get("pair_address") == p["pair_address"]
+                        for cfg in st.session_state["stable_configs"]
+                    )
+                    if exists:
+                        skipped_preview += 1
                 
-                if selected_display:
-                    st.dataframe(pd.DataFrame(selected_display), use_container_width=True)
+                with col_sum2:
+                    st.metric("可添加", f"{len(selected_indices) - skipped_preview} 个")
+                with col_sum3:
+                    st.metric("将跳过", f"{skipped_preview} 个")
                 
-                # 添加到配置按钮
-                col_btn1, col_btn2 = st.columns([1, 1])
+                if skipped_preview > 0:
+                    st.warning(f"⚠️ 其中有 {skipped_preview} 个交易对已存在于监控配置中，将被跳过")
+                
+                # 显示选中交易对的详细信息表格（可折叠）
+                with st.expander(f"📋 查看已选择的 {len(selected_indices)} 个交易对详情", expanded=False):
+                    selected_display = []
+                    for idx in selected_indices:
+                        p = collected_pairs[idx]
+                        base_sym = p["base_token"]["symbol"]
+                        quote_sym = p["quote_token"]["symbol"]
+                        pair_name = f"{base_sym}/{quote_sym}"
+                        
+                        exists = any(
+                            cfg.get("chain") == p["chain"] 
+                            and cfg.get("pair_address") == p["pair_address"]
+                            for cfg in st.session_state["stable_configs"]
+                        )
+                        
+                        selected_display.append({
+                            "交易对": pair_name,
+                            "链": p["chain"],
+                            "流动性(USD)": f"${p['liquidity_usd']:,.0f}",
+                            "价格(USD)": f"{p['price_usd']:.6f}" if p.get('price_usd') else "N/A",
+                            "状态": "⚠️已存在" if exists else "✅可添加",
+                            "Pair地址": p["pair_address"],
+                        })
+                    
+                    if selected_display:
+                        st.dataframe(pd.DataFrame(selected_display), use_container_width=True, hide_index=True)
+                
+                # 添加到配置按钮（优化：更明确的反馈）
+                col_btn1, col_btn2, col_btn3 = st.columns([2, 1, 1])
                 with col_btn1:
                     if st.button("✅ 添加选中的交易对到监控配置", type="primary", use_container_width=True):
                         added_count = 0
                         skipped_count = 0
+                        skipped_details = []
                         
                         for idx in selected_indices:
                             p = collected_pairs[idx]
@@ -3512,6 +3633,7 @@ def run_streamlit_panel():
                             
                             if exists:
                                 skipped_count += 1
+                                skipped_details.append(f"{pair_name} ({p['chain']})")
                                 continue
                             
                             new_cfg = {
@@ -3525,19 +3647,33 @@ def run_streamlit_panel():
                             added_count += 1
                         
                         save_stable_configs(st.session_state["stable_configs"])
-                        st.success(
-                            f"已添加 {added_count} 个交易对到监控配置"
-                            + (f"，跳过 {skipped_count} 个已存在的配置" if skipped_count > 0 else "")
-                        )
+                        
+                        # 更详细的成功提示
+                        if added_count > 0:
+                            st.success(f"✅ 成功添加 **{added_count}** 个交易对到监控配置！")
+                            if skipped_count > 0:
+                                st.info(f"ℹ️ 跳过 {skipped_count} 个已存在的配置：{', '.join(skipped_details[:5])}" + 
+                                       (f" 等 {skipped_count} 个" if skipped_count > 5 else ""))
+                        else:
+                            st.warning(f"⚠️ 没有添加任何交易对（所有 {skipped_count} 个都已存在）")
+                        
                         # 清空缓存和选中状态
                         st.session_state["collected_pairs_cache"] = []
-                        st.session_state["selected_pair_indices"] = set()
+                        st.session_state["selected_pair_indices"] = []
                         st.rerun()
                 
                 with col_btn2:
                     if st.button("🗑️ 清空选择", use_container_width=True):
-                        st.session_state["selected_pair_indices"] = set()
+                        st.session_state["selected_pair_indices"] = []
                         st.rerun()
+                
+                with col_btn3:
+                    if st.button("🔄 重新采集", use_container_width=True, help="清空当前结果，重新开始采集"):
+                        st.session_state["collected_pairs_cache"] = []
+                        st.session_state["selected_pair_indices"] = []
+                        st.rerun()
+            else:
+                st.info("💡 提示：请从上方列表中选择要添加的交易对")
         
         st.markdown("---")
 
