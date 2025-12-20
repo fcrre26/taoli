@@ -1354,7 +1354,9 @@ def search_stablecoin_pairs(
             pairs = data.get("pairs", [])
             for pair in pairs:
                 chain_id = pair.get("chainId", "").lower()
+                # 如果链ID不在选择的链列表中，跳过（但记录日志以便调试）
                 if chain_id not in chains:
+                    logger.debug(f"[搜索 {stable_symbol}] 跳过链 {chain_id}（不在选择的链列表中）")
                     continue
                 
                 base_token = pair.get("baseToken", {})
@@ -4108,6 +4110,9 @@ def run_streamlit_panel():
                             skipped_details = []
                             error_details = []
                             
+                            # 先收集所有要添加的配置（避免在循环中修改 session_state 导致问题）
+                            configs_to_add = []
+                            
                             for idx in selected_indices:
                                 try:
                                     # 验证索引有效性
@@ -4118,9 +4123,17 @@ def run_streamlit_panel():
                                     p = collected_pairs[idx]
                                     
                                     # 验证必要字段
-                                    if not p.get("chain") or not p.get("pair_address"):
-                                        error_details.append(f"索引 {idx}: 缺少必要字段（chain 或 pair_address）")
+                                    chain_value = p.get("chain")
+                                    pair_address_value = p.get("pair_address")
+                                    if not chain_value or not pair_address_value:
+                                        error_details.append(
+                                            f"索引 {idx}: 缺少必要字段（chain={chain_value}, pair_address={pair_address_value}）"
+                                        )
+                                        logger.warning(f"索引 {idx} 的币对数据缺少必要字段: chain={chain_value}, pair_address={pair_address_value}")
                                         continue
+                                    
+                                    # 记录链信息（用于调试新链问题）
+                                    logger.debug(f"处理索引 {idx}: chain={chain_value}, pair_address={pair_address_value[:20]}...")
                                     
                                     base_sym = p.get("base_token", {}).get("symbol", "")
                                     quote_sym = p.get("quote_token", {}).get("symbol", "")
@@ -4131,7 +4144,7 @@ def run_streamlit_panel():
                                     
                                     pair_name = f"{base_sym}/{quote_sym}"
                                     
-                                    # 检查是否已存在
+                                    # 检查是否已存在（使用当前的 session_state，因为我们在循环外收集配置）
                                     exists = any(
                                         cfg.get("chain") == p["chain"] 
                                         and cfg.get("pair_address") == p["pair_address"]
@@ -4143,24 +4156,65 @@ def run_streamlit_panel():
                                         skipped_details.append(f"{pair_name} ({p['chain']})")
                                         continue
                                     
+                                    # 确保使用采集数据中的链信息（而不是任何默认值）
+                                    chain_from_pair = p.get("chain")
+                                    if not chain_from_pair:
+                                        error_details.append(f"索引 {idx}: 采集数据中缺少 chain 字段")
+                                        logger.warning(f"索引 {idx} 的币对数据缺少 chain 字段: {p}")
+                                        continue
+                                    
                                     new_cfg = {
                                         "name": pair_name,
-                                        "chain": p["chain"],
+                                        "chain": chain_from_pair,  # 使用采集数据中的链信息
                                         "pair_address": p["pair_address"],
                                         "anchor_price": float(default_anchor_val),
                                         "threshold": float(default_threshold_val),
                                     }
-                                    st.session_state["stable_configs"].append(new_cfg)
-                                    added_count += 1
+                                    logger.debug(f"准备添加配置: {pair_name} on {chain_from_pair}, pair_address={p['pair_address'][:20]}...")
+                                    configs_to_add.append(new_cfg)
                                     
                                 except Exception as e:
                                     error_details.append(f"索引 {idx}: {str(e)}")
                                     logger.error(f"添加配置时出错（索引 {idx}）: {e}", exc_info=True)
                                     continue
                             
+                            # 一次性添加所有配置
+                            if configs_to_add:
+                                # 记录要添加的配置信息（用于调试）
+                                for cfg in configs_to_add:
+                                    logger.info(
+                                        f"添加配置: name={cfg['name']}, chain={cfg['chain']}, "
+                                        f"pair_address={cfg['pair_address'][:20]}..."
+                                    )
+                                
+                                st.session_state["stable_configs"].extend(configs_to_add)
+                                added_count = len(configs_to_add)
+                                logger.info(
+                                    f"准备添加 {added_count} 个配置到 session_state，"
+                                    f"当前总数: {len(st.session_state['stable_configs'])}"
+                                )
+                            
                             # 保存配置
                             try:
+                                config_count_before_save = len(st.session_state["stable_configs"])
                                 save_stable_configs(st.session_state["stable_configs"])
+                                logger.info(f"保存配置成功，保存前数量: {config_count_before_save}")
+                                
+                                # 验证保存是否成功：立即重新加载并检查
+                                loaded_configs = load_stable_configs()
+                                config_count_after_load = len(loaded_configs)
+                                logger.info(f"重新加载配置成功，加载后数量: {config_count_after_load}")
+                                
+                                if config_count_after_load != config_count_before_save:
+                                    st.warning(
+                                        f"⚠️ 配置数量不匹配！保存前: {config_count_before_save} 个，"
+                                        f"加载后: {config_count_after_load} 个。"
+                                        f"请检查配置文件 {CONFIG_FILE} 是否正确。"
+                                    )
+                                    logger.warning(
+                                        f"配置数量不匹配！保存前: {config_count_before_save}，"
+                                        f"加载后: {config_count_after_load}"
+                                    )
                             except Exception as e:
                                 st.error(f"❌ 保存配置失败: {e}")
                                 logger.error(f"保存配置失败: {e}", exc_info=True)
@@ -4169,6 +4223,7 @@ def run_streamlit_panel():
                             # 更详细的成功提示
                             if added_count > 0:
                                 st.success(f"✅ 成功添加 **{added_count}** 个交易对到监控配置！")
+                                st.info(f"💡 当前配置总数: **{len(st.session_state['stable_configs'])}** 个")
                                 st.info("💡 提示：配置已保存，请查看主界面查看监控数据。页面将自动刷新...")
                                 if skipped_count > 0:
                                     st.info(f"ℹ️ 跳过 {skipped_count} 个已存在的配置：{', '.join(skipped_details[:5])}" + 
@@ -4176,6 +4231,7 @@ def run_streamlit_panel():
                                 
                                 # 重新加载配置，确保界面显示最新数据
                                 st.session_state["stable_configs"] = load_stable_configs()
+                                logger.info(f"刷新后 session state 中的配置数量: {len(st.session_state['stable_configs'])}")
                                 
                                 # 更新采集结果缓存（移除已添加的项，保留未添加的）
                                 remaining_pairs = []
