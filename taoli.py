@@ -5121,6 +5121,122 @@ def run_streamlit_panel():
         save_send_log([])
         st.success("已清空发送日志")
         st.rerun()
+    
+    st.markdown("---")
+    st.subheader("📋 系统日志")
+    st.caption("查看系统运行日志（包括自动采集、API 请求等）")
+    
+    # 日志文件路径
+    log_dir = "logs"
+    today_log_file = os.path.join(log_dir, f"taoli_{datetime.now().strftime('%Y%m%d')}.log")
+    today_error_log_file = os.path.join(log_dir, f"taoli_error_{datetime.now().strftime('%Y%m%d')}.log")
+    
+    # 日志类型选择
+    log_type = st.radio(
+        "选择日志类型",
+        options=["全部日志", "错误日志"],
+        horizontal=True,
+        key="log_type_selector"
+    )
+    
+    # 日志行数选择
+    log_lines = st.slider(
+        "显示最近多少行",
+        min_value=50,
+        max_value=1000,
+        value=200,
+        step=50,
+        key="log_lines_slider"
+    )
+    
+    # 日志级别过滤
+    log_levels = st.multiselect(
+        "过滤日志级别",
+        options=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default=["INFO", "WARNING", "ERROR"],
+        key="log_levels_filter"
+    )
+    
+    # 关键词搜索
+    log_keyword = st.text_input(
+        "关键词搜索（留空显示全部）",
+        value="",
+        key="log_keyword_search",
+        placeholder="例如：自动采集、API、错误等"
+    )
+    
+    def read_log_file(file_path: str, max_lines: int = 200) -> list[str]:
+        """读取日志文件的最后 N 行"""
+        if not os.path.exists(file_path):
+            return []
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+                # 返回最后 N 行
+                return lines[-max_lines:] if len(lines) > max_lines else lines
+        except Exception as e:
+            logger.error(f"读取日志文件失败: {e}")
+            return []
+    
+    def filter_logs(lines: list[str], levels: list[str], keyword: str) -> list[str]:
+        """过滤日志行"""
+        filtered = []
+        for line in lines:
+            # 检查日志级别
+            level_match = any(level in line for level in levels) if levels else True
+            
+            # 检查关键词
+            keyword_match = keyword.lower() in line.lower() if keyword else True
+            
+            if level_match and keyword_match:
+                filtered.append(line)
+        return filtered
+    
+    # 读取日志
+    if log_type == "错误日志":
+        log_file = today_error_log_file
+    else:
+        log_file = today_log_file
+    
+    log_lines_content = read_log_file(log_file, max_lines=log_lines * 2)  # 多读一些，因为过滤后可能变少
+    filtered_logs = filter_logs(log_lines_content, log_levels, log_keyword)
+    
+    # 只显示最后 N 行（过滤后的）
+    display_logs = filtered_logs[-log_lines:] if len(filtered_logs) > log_lines else filtered_logs
+    
+    # 显示日志统计
+    col_log_stat1, col_log_stat2, col_log_stat3 = st.columns(3)
+    with col_log_stat1:
+        st.metric("总日志行数", len(log_lines_content))
+    with col_log_stat2:
+        st.metric("过滤后行数", len(filtered_logs))
+    with col_log_stat3:
+        st.metric("显示行数", len(display_logs))
+    
+    # 显示日志内容
+    if display_logs:
+        # 使用代码块显示，支持滚动
+        log_text = "".join(display_logs)
+        st.code(log_text, language="text")
+        
+        # 下载日志按钮
+        if st.button("📥 下载当前显示的日志", use_container_width=True):
+            st.download_button(
+                label="点击下载",
+                data=log_text,
+                file_name=f"taoli_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                mime="text/plain",
+                key="download_log_btn"
+            )
+    else:
+        if not os.path.exists(log_file):
+            st.warning(f"日志文件不存在: {log_file}")
+        else:
+            st.info("没有匹配的日志记录（请调整过滤条件）")
+    
+    # 刷新按钮
+    if st.button("🔄 刷新日志", use_container_width=True):
+        st.rerun()
 
 
 # ========== 入口选择 ==========
